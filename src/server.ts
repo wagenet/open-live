@@ -58,6 +58,11 @@ export async function buildServer() {
       directives: { defaultSrc: ["'none'"], connectSrc: ["'self'"] },
     },
     crossOriginResourcePolicy: { policy: 'cross-origin' },
+    strictTransportSecurity: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
   });
 
   // Rate limiting — 200 requests per minute per IP on API routes
