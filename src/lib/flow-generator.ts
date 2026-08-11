@@ -535,7 +535,9 @@ export async function activateStromFlow(
         id: inputId,
         block_definition_id: 'builtin.whip_input',
         name: `WHIP Input (V${padIndex})`,
-        properties: { endpoint_id: endpointId },
+        // do_retransmission: false — works around a gst-plugins-base crash in
+        // RTX + RTP header-extension aggregation (see strom fix 239ec19).
+        properties: { endpoint_id: endpointId, do_retransmission: false },
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
@@ -713,6 +715,7 @@ export async function activateStromFlow(
           name: outputDoc.name,
           properties: {
             endpoint_id: endpointId,
+            do_retransmission: false,
             ...(mainAudioSource && { num_audio_tracks: 1 + (monitorAudioSource ? 1 : 0) + auxCount }),
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
