@@ -596,10 +596,16 @@ async function handleMessage(
       pvwPipByProduction.set(productionId, newPvwPip);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
-      // `pgmBgByProduction` is not updated until the Strom block below, and only
-      // if those calls succeed, so derive the new background from what is in
-      // scope rather than reading a map that is still holding the old state.
-      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmPip !== null ? (pvwBeforePipByProduction.get(productionId) ?? null) : null });
+      // The background behind the PiP after this take. Derived from what is in
+      // scope, because `pgmBgByProduction` still holds the previous state here.
+      const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
+      const newPgmBg = newPgmPip !== null ? pvwBeforePip : null;
+      // Recorded before the Strom calls, not inside them. A client connecting
+      // later reads this map, so leaving it unset until Strom succeeds meant a
+      // reconnect during a PiP saw `pgm: null` with no background — the one case
+      // that cannot be reconstructed, and the reason this field exists.
+      if (newPgmPip !== null) pgmBgByProduction.set(productionId, newPgmBg);
+      broadcast(productionId, { type: 'TALLY', ...newTally, pgmBg: newPgmBg });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
       if (curPvwPip !== null) {
@@ -613,7 +619,6 @@ async function handleMessage(
           try {
             const strom = await makeStromClient();
             const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
-            const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
             const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
             await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
             await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
@@ -622,9 +627,7 @@ async function handleMessage(
               transition_type: takeTransition,
               ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
             });
-            // Track the new Strom PGM background (pvwBeforePip) so CUT/TRANSITION
-            // can pass the correct from_input while the PiP remains on PGM.
-            pgmBgByProduction.set(productionId, pvwBeforePip);
+            // `pgmBgByProduction` was already set above, before these calls.
             pvwBeforePipByProduction.delete(productionId);
           } catch (err) {
             console.warn('[controller] Strom PiP transition error:', err);
