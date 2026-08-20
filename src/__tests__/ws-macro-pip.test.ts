@@ -164,6 +164,33 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
+// The PGM background must be recorded even when Strom is unconfigured
+// ---------------------------------------------------------------------------
+
+describe('pgmBg with no Strom flow configured', () => {
+  it('records the background behind the PiP so later tallies still carry it', async () => {
+    mockGet.mockResolvedValue({
+      ...makeProductionDoc([{ type: 'CUT', sourceId: 'cam3' }]),
+      stromFlowId: undefined,
+      mixerBlockId: undefined,
+    });
+
+    await send({ type: 'SELECT_PVW_PIP', pip: 0 });
+    await send({ type: 'TAKE' });
+    resetRecordings();
+
+    // `pgmBgByProduction` is what a connecting client is served from. The
+    // connect sync lives in the plugin rather than handleMessage, so observe
+    // the map through a later TALLY, which reads it instead of recomputing it.
+    // SET_PVW is the vehicle: it touches only preview, so the PiP stays on
+    // program and the recorded background must still be reported.
+    await send({ type: 'SET_PVW', mixerInput: 'video_in_2' });
+
+    expect(tallies()[0]).toMatchObject({ pgmBg: 'video_in_1' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Macro CUT / TRANSITION over a PiP that is on program
 // ---------------------------------------------------------------------------
 
