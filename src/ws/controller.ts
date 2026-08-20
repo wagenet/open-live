@@ -599,7 +599,11 @@ async function handleMessage(
       // The background behind the PiP after this take. Derived from what is in
       // scope, because `pgmBgByProduction` still holds the previous state here.
       const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
-      const newPgmBg = newPgmPip !== null ? pvwBeforePip : null;
+      // Falls back to the outgoing PGM input, matching the `to_input` the Strom
+      // transition below computes: when no PVW source was displaced, the mixer
+      // composites the PiP over whatever was already on program. Reporting null
+      // here would say "no background" while the mixer had one.
+      const newPgmBg = newPgmPip !== null ? (pvwBeforePip ?? tally.pgm) : null;
       // Recorded before the Strom calls, not inside them. A client connecting
       // later reads this map, so leaving it unset until Strom succeeds meant a
       // reconnect during a PiP saw `pgm: null` with no background — the one case
