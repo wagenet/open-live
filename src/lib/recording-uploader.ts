@@ -20,9 +20,9 @@
  * Persisting a RecordingDoc and the listing/playback endpoint are issue #42 and
  * deliberately NOT implemented here.
  */
-import { createHash, createHmac } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 import { config } from '../config.js';
-import type { StromClient } from './strom.js';
+import { StromClientError, type MediaEntry, type StromClient } from './strom.js';
 
 export interface MinioTarget {
   endpoint: string; // host[:port], no scheme
@@ -37,6 +37,10 @@ export interface UploadedSegment {
   /** object key written into the bucket */
   key: string;
   sizeBytes: number;
+  /** Start of the activation that recorded it, when its directory name carries one (ISO 8601). */
+  activationStartedAt?: string;
+  /** When Strom last wrote the file (ISO 8601), if Strom reported it. */
+  modifiedAt?: string;
 }
 
 export interface UploadResult {
@@ -262,6 +266,38 @@ async function downloadFromStrom(
   return Buffer.from(await res.arrayBuffer());
 }
 
+/** Strom media directory holding every recording of a production. */
+export function productionRecordingsDir(productionId: string): string {
+  return `recordings/${productionId}`;
+}
+
+/**
+ * Directory name for one activation's recordings: the activation start as
+ * YYYYMMDDTHHMMSSZ, then a uuid so two activations never share a directory.
+ */
+export function activationRecordingsDirName(startedAt: Date = new Date()): string {
+  const stamp = startedAt.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  return `${stamp}-${randomUUID()}`;
+}
+
+/** Inverse of activationRecordingsDirName's timestamp, as ISO 8601; undefined if absent. */
+function activationStartFromDirName(name: string): string | undefined {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/.exec(name);
+  if (!m) return undefined;
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z`;
+}
+
+function keyPrefix(): string {
+  return config.recordingKeyPrefix
+    ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
+    : '';
+}
+
+/** Object key a recorded file is uploaded to. */
+export function recordingObjectKey(productionId: string, fileName: string): string {
+  return `${keyPrefix()}${productionId}/${fileName}`;
+}
+
 export interface UploadRecordingsArgs {
   strom: StromClient;
   /** Base URL of the Strom instance (for the raw media download). */
@@ -283,22 +319,78 @@ export interface UploadRecordingsArgs {
  * none, and deactivate must not fail because one segment errored.
  */
 export async function uploadRecordings(args: UploadRecordingsArgs): Promise<UploadResult> {
-  const { strom, stromUrl, stromToken, outputDir, productionId, target } = args;
+  const { strom, outputDir } = args;
+  const result: UploadResult = { uploaded: [], failed: [] };
+  const listing = await strom.media.list(outputDir);
+  const files = (listing.entries ?? []).filter((e) => !e.is_directory);
+  await uploadFiles(args, files, undefined, async () => false, result);
+  return result;
+}
+
+export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArgs, 'outputDir'> {
+  /**
+   * Also upload files directly in the production's directory, where a recorder
+   * activated before per-activation directories wrote them.
+   */
+  includeSharedDir: boolean;
+  /** Whether an object key has already been uploaded and registered; those files are skipped. */
+  isUploaded: (key: string) => Promise<boolean>;
+}
+
+/**
+ * Uploads every recording of a production that has not been uploaded yet:
+ * each activation's directory under productionRecordingsDir(), so a session
+ * whose upload failed at its own deactivate is picked up by a later one.
+ * A production that never recorded (no directory on Strom) uploads nothing.
+ */
+export async function uploadProductionRecordings(args: UploadProductionRecordingsArgs): Promise<UploadResult> {
+  const { strom, productionId, includeSharedDir, isUploaded } = args;
   const result: UploadResult = { uploaded: [], failed: [] };
 
-  const listing = await strom.media.list(outputDir);
-  const files = (listing.entries ?? []).filter((e) => !e.is_dir);
+  let entries: MediaEntry[];
+  try {
+    entries = (await strom.media.list(productionRecordingsDir(productionId))).entries ?? [];
+  } catch (err) {
+    if (err instanceof StromClientError && err.status === 404) return result;
+    throw err;
+  }
 
-  const prefix = config.recordingKeyPrefix
-    ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
-    : '';
+  if (includeSharedDir) {
+    await uploadFiles(args, entries.filter((e) => !e.is_directory), undefined, isUploaded, result);
+  }
+  for (const dir of entries.filter((e) => e.is_directory)) {
+    let files: MediaEntry[];
+    try {
+      files = ((await strom.media.list(dir.path)).entries ?? []).filter((e) => !e.is_directory);
+    } catch (err) {
+      result.failed.push({ file: dir.path, error: err instanceof Error ? err.message : String(err) });
+      continue;
+    }
+    await uploadFiles(args, files, activationStartFromDirName(dir.name), isUploaded, result);
+  }
+  return result;
+}
 
+async function uploadFiles(
+  args: Omit<UploadRecordingsArgs, 'outputDir'>,
+  files: MediaEntry[],
+  activationStartedAt: string | undefined,
+  isUploaded: (key: string) => Promise<boolean>,
+  result: UploadResult,
+): Promise<void> {
+  const { stromUrl, stromToken, productionId, target } = args;
   for (const entry of files) {
     try {
+      const key = recordingObjectKey(productionId, entry.name);
+      if (await isUploaded(key)) continue;
       const bytes = await downloadFromStrom(stromUrl, stromToken, entry.path);
-      const key = `${prefix}${productionId}/${entry.name}`;
       await putObject(target, key, bytes, contentTypeForFile(entry.name));
-      result.uploaded.push({ key, sizeBytes: bytes.length });
+      result.uploaded.push({
+        key,
+        sizeBytes: bytes.length,
+        ...(activationStartedAt ? { activationStartedAt } : {}),
+        ...(entry.modified ? { modifiedAt: new Date(entry.modified * 1000).toISOString() } : {}),
+      });
     } catch (err) {
       result.failed.push({
         file: entry.path,
@@ -306,6 +398,4 @@ export async function uploadRecordings(args: UploadRecordingsArgs): Promise<Uplo
       });
     }
   }
-
-  return result;
 }
