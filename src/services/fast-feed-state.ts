@@ -41,6 +41,22 @@ const confirmedProductions = new Set<string>();
 const pendingWrite = new Map<string, Promise<void>>();
 /** A write queued behind another and not yet sent, with the router it is for. */
 const waitingWrite = new Map<string, { flowId: string; blockId: string; write: Promise<void> }>();
+/**
+ * The production's router writes since its state was last cleared: how many were
+ * sent, and the newest one Strom has answered. A write from before a clear sees a
+ * different object and neither writes nor resyncs.
+ */
+interface WriteRun { sent: number; landed: number }
+const writeRuns = new Map<string, WriteRun>();
+
+function writeRunFor(productionId: string): WriteRun {
+  let run = writeRuns.get(productionId);
+  if (!run) {
+    run = { sent: 0, landed: 0 };
+    writeRuns.set(productionId, run);
+  }
+  return run;
+}
 
 function stateFor(productionId: string): ChannelState {
   let s = stateByProduction.get(productionId);
@@ -106,11 +122,19 @@ export function recordFastFeedChanges(productionId: string, changes: Iterable<Fa
   };
 }
 
-/** Forgets the production's channel state (every channel open at unity) and that it matched the mixer. */
+/**
+ * Forgets the production's channel state (every channel open at unity), that it
+ * matched the mixer, and its router writes: one still on its way is not waited
+ * for, and one not yet sent is dropped.
+ */
 export function clearFastFeedState(productionId: string): void {
   stateByProduction.delete(productionId);
   confirmedProductions.delete(productionId);
+  pendingWrite.delete(productionId);
+  waitingWrite.delete(productionId);
+  writeRuns.delete(productionId);
 }
+
 
 /** Marks the production's channel state as matching its mixer, so it may be written to the router. */
 export function confirmFastFeedState(productionId: string): void {
@@ -132,8 +156,8 @@ const ROUTER_WRITE_TIMEOUT_MS = 5000;
  * write already on its way. Callers do not wait for it: the crew's own feedback
  * never waits on the fast feeds. A write still waiting its turn picks up later
  * changes, so a slow router gets one write, not a backlog. A failure or timeout
- * is logged and costs only the fast feeds' copy of the change; a timed-out write
- * that lands later is followed by a fresh one.
+ * is logged and costs only the fast feeds' copy of the change. A timed-out write
+ * that lands after a later write is followed by a fresh one.
  *
  * @param onlyIfChanged skip the write when nothing has been recorded (the router
  *   was built with every channel open at unity)
@@ -149,11 +173,21 @@ export function syncFastFeedRouter(
   const waiting = waitingWrite.get(productionId);
   if (waiting && waiting.flowId === router.flowId && waiting.blockId === router.blockId) return waiting.write;
 
+  const run = writeRunFor(productionId);
   const previous = pendingWrite.get(productionId) ?? Promise.resolve();
   const next: Promise<void> = previous.then(async () => {
     if (waitingWrite.get(productionId)?.write === next) waitingWrite.delete(productionId);
+    if (writeRuns.get(productionId) !== run) return;
     const routing_matrix = fastFeedMatrix(productionId, router);
+    const sent = ++run.sent;
     const request = strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } });
+    // Strom may answer writes out of order. One answered after a later write
+    // has put an older matrix back, so the current state goes out again.
+    void request.then(() => {
+      const overtaken = run.landed > sent;
+      run.landed = Math.max(run.landed, sent);
+      if (overtaken && writeRuns.get(productionId) === run) void syncFastFeedRouter(productionId, router, strom);
+    }, () => undefined);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     const timeout = new Promise<void>((resolve) => {
@@ -162,12 +196,7 @@ export function syncFastFeedRouter(
     await Promise.race([request, timeout])
       .catch((err) => console.warn('[fast-feed] router update error:', String(err)))
       .finally(() => clearTimeout(timer));
-    if (timedOut) {
-      console.warn(`[fast-feed] router update timed out after ${ROUTER_WRITE_TIMEOUT_MS} ms`);
-      // The next write goes out now. Strom may still apply this one after it, so
-      // once it lands, write the current state again.
-      request.then(() => { void syncFastFeedRouter(productionId, router, strom); }, () => undefined);
-    }
+    if (timedOut) console.warn(`[fast-feed] router update timed out after ${ROUTER_WRITE_TIMEOUT_MS} ms`);
   }).finally(() => {
     if (pendingWrite.get(productionId) === next) pendingWrite.delete(productionId);
   });

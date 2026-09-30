@@ -62,6 +62,8 @@ let elementFails = false;
 let slowNextResetReplyMs = 0;
 /** Answer the next REST audio write this late (ms); Strom applies it on arrival. */
 let slowNextElementReplyMs = 0;
+/** What a read of the mixer's properties returns. */
+let mixerReadProps: Record<string, unknown> = {};
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -96,7 +98,7 @@ const stromServer: Server = createServer((req, res) => {
       return;
     }
     if (req.method === 'GET' && req.url === MIXER_PATH) {
-      res.end(JSON.stringify({ properties: {} }));
+      res.end(JSON.stringify({ properties: mixerReadProps }));
       return;
     }
     res.end(JSON.stringify({ success: true }));
@@ -159,12 +161,25 @@ async function patchAudio(elementId: string, payload: Record<string, unknown>) {
   return res;
 }
 
+/** A full read of the three-channel mixer: every channel on program, unmuted, at unity unless overridden. */
+function mixerProps(overrides: Record<number, { toMain?: boolean; muted?: boolean; fader?: number }>): Record<string, unknown> {
+  const props: Record<string, unknown> = {};
+  for (let ch = 1; ch <= 3; ch++) {
+    const o = overrides[ch] ?? {};
+    props[`ch${ch}_to_main`] = o.toMain ?? true;
+    props[`ch${ch}_mute`] = o.muted ?? false;
+    props[`ch${ch}_fader`] = o.fader ?? 1;
+  }
+  return props;
+}
+
 beforeEach(async () => {
   patches.length = 0;
   mixerFails = false;
   elementFails = false;
   slowNextResetReplyMs = 0;
   slowNextElementReplyMs = 0;
+  mixerReadProps = {};
   productionDocs.clear();
   productionDocs.set(PROD, makeProduction());
   clearAudioState(PROD);
@@ -219,6 +234,34 @@ describe('fast feeds after a server restart', () => {
     await connectOnce();
     expect(patches.some((p) => p.path === MIXER_PATH)).toBe(true);
     expect(routerMatrices()).toEqual([]);
+  });
+
+  it('takes the fast feeds from the mixer when the first connect\'s reset is refused, and follows the crew from there', async () => {
+    clearAudioState(PROD);
+    patches.length = 0;
+    // The mixer still has ch3 off program and ch1 at half level from before the restart.
+    mixerReadProps = mixerProps({ 1: { fader: 0.5 }, 3: { toMain: false } });
+    mixerFails = true;
+    await connectOnce();
+    mixerFails = false;
+    const gains = new Map([[0, 0.5], [1, 1], [2, 1]]);
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]), gains)]);
+
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2]), gains));
+  });
+
+  it('takes the fast feeds from the mixer on a later connect when the refused reset\'s connect could not read it', async () => {
+    clearAudioState(PROD);
+    patches.length = 0;
+    mixerFails = true;
+    await connectOnce(); // the pipeline reads as empty
+    mixerFails = false;
+    expect(routerMatrices()).toEqual([]);
+
+    mixerReadProps = mixerProps({ 2: { muted: true } });
+    await connectOnce();
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([1]), new Map([[0, 1], [1, 1], [2, 1]]))]);
   });
 
   it('keeps a crew change made while the first connect\'s reset is on its way', async () => {

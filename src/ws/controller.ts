@@ -26,7 +26,7 @@ import {
   type PersistedReturnBus,
   type ReturnMode,
 } from '../lib/return-feeds.js';
-import { recordFastFeedChanges, clearFastFeedState, confirmFastFeedState, syncFastFeedRouter } from '../services/fast-feed-state.js';
+import { recordFastFeedChanges, clearFastFeedState, confirmFastFeedState, syncFastFeedRouter, type FastFeedChange } from '../services/fast-feed-state.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -606,6 +606,12 @@ const afvChannelsByProduction = new Map<string, Set<string>>()
 const mutedElementsByProduction = new Map<string, Set<string>>()
 
 /**
+ * Productions whose first connect's reset the mixer refused, so the fast feeds'
+ * channel state is not known to match the mixer. The next mixer read fills it.
+ */
+const fastFeedAwaitingMixerRead = new Set<string>()
+
+/**
  * Last-seen stromFlowId per production.
  * A changed flowId means the pipeline was rebuilt (sources remapped, etc.) so
  * any cached channel-index state is invalid and must be cleared immediately
@@ -784,6 +790,7 @@ export function clearAudioState(productionId: string): void {
   afvRampByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
   clearFastFeedState(productionId)
+  fastFeedAwaitingMixerRead.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
   sourceAudioOffsetsByProduction.delete(productionId)
@@ -2812,8 +2819,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               channelLevelsByProduction.set(id, levelCache);
               // The reset opens every channel at unity, and the fast feeds follow it
               // like any crew change: a change sent while it is on its way lands
-              // after it and is kept, and a refused reset leaves the fast feeds as
-              // they were. The router may still hold what the crew set before a restart.
+              // after it and is kept. After a refused reset, the fast feeds take their
+              // state from the mixer read below. The router may still hold what the
+              // crew set before a restart.
               const undoFast = recordFastFeedChanges(id, Array.from({ length: numChannels }, (_, channel) => [
                 { channel, toMain: true }, { channel, muted: false }, { channel, gain: 1 },
               ]).flat());
@@ -2824,6 +2832,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
               } else {
                 undoFast();
+                fastFeedAwaitingMixerRead.add(id);
               }
             }
             // Restore fader levels and mute state.
@@ -2834,6 +2843,24 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
             const levelCache = channelLevelsByProduction.get(id);
             const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
+            if (blockProps && fastFeedAwaitingMixerRead.has(id)) {
+              // The reset was refused, so take the fast feeds' state from what the
+              // mixer holds. A read missing any channel's values (a pipeline that is
+              // not running reads as empty) leaves it to the next connect.
+              const p = blockProps.properties;
+              const changes: FastFeedChange[] = [];
+              for (let i = 1; i <= numChannels; i++) {
+                const toMain = p[`ch${i}_to_main`], muted = p[`ch${i}_mute`], gain = p[`ch${i}_fader`];
+                if (typeof toMain !== 'boolean' || typeof muted !== 'boolean' || typeof gain !== 'number') break;
+                changes.push({ channel: i - 1, toMain }, { channel: i - 1, muted }, { channel: i - 1, gain });
+              }
+              if (numChannels > 0 && changes.length === numChannels * 3) {
+                fastFeedAwaitingMixerRead.delete(id);
+                recordFastFeedChanges(id, changes);
+                confirmFastFeedState(id);
+                void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
+              }
+            }
             for (let i = 1; i <= numChannels; i++) {
               const cachedLevel = levelCache?.get(`ch${i}`);
               const stromLevel = blockProps?.properties[`ch${i}_fader`];
