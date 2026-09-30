@@ -12,6 +12,7 @@ import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
+import { conversationFlowDescription, conversationFlowOwner, planFastReturns, type FastReturnPlan } from './fast-returns.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -56,6 +57,12 @@ export interface ActivationResult {
   returnBuses: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
   /** WHEP endpoint IDs for per-guest return outputs, keyed by the guest's mixerInput. */
   returnWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
+  /**
+   * Audio-only fast return endpoints (`returnFeed.lowLatency`), keyed by the
+   * guest's mixerInput. Empty when no guest asked for one or the conversation
+   * flow could not start.
+   */
+  fastWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -995,6 +1002,36 @@ export async function activateStromFlow(
     }
   }
 
+  // Fast return feeds (`returnFeed.lowLatency`): tap every audio channel's source
+  // into a bridge here; the mix-minus and its WHEP outputs run in a separate
+  // conversation flow, created once this flow is playing.
+  let fastPlan: FastReturnPlan | null = null;
+  const fastRequests = returnBuses
+    .filter((rb) => rb.assignment.returnFeed?.lowLatency === true)
+    .map((rb) => {
+      const padMatch = /video_in_(\d+)$/.exec(rb.assignment.mixerInput);
+      return { mixerInput: rb.assignment.mixerInput, padIndex: padMatch ? parseInt(padMatch[1]!, 10) : 0, ownChannel: rb.ownChannel };
+    });
+  if (audioMixerBlockId && fastRequests.length > 0) {
+    const inputPad = new RegExp(`^${audioMixerBlockId}:input_(\\d+)$`);
+    const channelSources: string[] = [];
+    for (const link of flow.links as Array<Record<string, unknown>>) {
+      const m = inputPad.exec((link['to'] as string | undefined) ?? '');
+      if (m) channelSources[parseInt(m[1]!, 10) - 1] = link['from'] as string;
+    }
+    const dense = channelSources.length > 0 && channelSources.every((pad) => typeof pad === 'string');
+    const target = production.values?.fast_return_latency_ms;
+    fastPlan = dense
+      ? planFastReturns(endpointSuffix, channelSources, fastRequests, typeof target === 'number' ? target : undefined)
+      : null;
+    if (fastPlan) {
+      flow.blocks.push(...fastPlan.programBlocks);
+      flow.links.push(...fastPlan.programLinks);
+    } else {
+      console.warn('[flow-generator] Fast return feeds skipped: an audio channel has no source link');
+    }
+  }
+
   // Compute encoder block positions — shared by loudness block and group drain placement.
   const encBlocks = flow.blocks.filter(
     (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
@@ -1101,6 +1138,10 @@ export async function activateStromFlow(
     throw err;
   }
 
+  const fastWhepEntries = fastPlan
+    ? await startConversationFlow(strom, flowId, `${flowName}-conv`, fastPlan, clockType)
+    : [];
+
   return {
     flowId,
     mixerBlockId,
@@ -1120,17 +1161,68 @@ export async function activateStromFlow(
       mode: rb.mode,
     })),
     returnWhepEntries,
+    fastWhepEntries,
   };
 }
 
 /**
- * Stops and deletes the Strom flow associated with a production.
- * Silently ignores errors (flow may already be gone).
+ * Creates and starts the conversation flow that carries the fast return feeds.
+ * A failure (for example a Strom without the audio bridge blocks) costs only the
+ * fast feeds: the program flow keeps running and the picture feeds still work.
+ */
+async function startConversationFlow(
+  strom: StromClient,
+  programFlowId: string,
+  name: string,
+  plan: FastReturnPlan,
+  clockType: string | undefined,
+): Promise<FastReturnPlan['entries']> {
+  let flowId: string | undefined;
+  try {
+    const created = await strom.flows.create({
+      id: randomUUID(),
+      name,
+      properties: {
+        description: conversationFlowDescription(programFlowId),
+        ephemeral: true,
+        ...(clockType ? { clock_type: clockType } : {}),
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      elements: plan.conversation.elements as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      blocks: plan.conversation.blocks as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      links: plan.conversation.links as any,
+    });
+    flowId = created.flow.id;
+    await strom.flows.start(flowId);
+    return plan.entries;
+  } catch (err) {
+    console.warn('[flow-generator] Conversation flow failed to start; fast return feeds unavailable:', err);
+    if (flowId) await strom.flows.delete(flowId).catch(() => undefined);
+    return [];
+  }
+}
+
+/**
+ * Stops and deletes the Strom flow associated with a production, and its
+ * conversation flow if it has one. Silently ignores errors (flow may already be gone).
  */
 export async function deactivateStromFlow(
   stromFlowId: string,
   strom: StromClient,
 ): Promise<void> {
+  try {
+    const { flows } = await strom.flows.list();
+    for (const f of flows) {
+      const description = (f.properties as { description?: string } | undefined)?.description;
+      if (conversationFlowOwner(description) !== stromFlowId) continue;
+      await strom.flows.stop(f.id).catch(() => undefined);
+      await strom.flows.delete(f.id).catch(() => undefined);
+    }
+  } catch {
+    // ignore — Strom unreachable or no list; the program flow teardown below still runs
+  }
   try {
     await strom.flows.stop(stromFlowId);
   } catch {

@@ -184,3 +184,113 @@ describe('activateStromFlow — per-guest return feeds', () => {
     expect(returnBlocks).toHaveLength(0);
   });
 });
+
+describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function makeTwoFlowStrom(opts: { conversationStartFails?: boolean } = {}) {
+    const created: Record<string, unknown>[] = [];
+    return {
+      flows: {
+        create: vi.fn().mockImplementation((flow: Record<string, unknown>) => {
+          created.push(flow);
+          return Promise.resolve({ flow: { id: created.length === 1 ? 'flow-program' : 'flow-conv' } });
+        }),
+        start: vi.fn().mockImplementation((id: string) =>
+          id === 'flow-conv' && opts.conversationStartFails ? Promise.reject(new Error('no such block')) : Promise.resolve({})),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+      created,
+    };
+  }
+
+  const guests = [
+    { sourceId: '__test1__', mixerInput: 'video_in_0' },
+    { sourceId: 'Whip', mixerInput: 'video_in_1', returnFeed: { synced: 'program-minus' as const, lowLatency: true } },
+    { sourceId: 'Whip', mixerInput: 'video_in_2', returnFeed: { synced: 'program-minus' as const } },
+  ];
+
+  it('taps every audio channel into a bridge and builds the mix-minus in a conversation flow', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeTwoFlowStrom();
+    const result = await activateStromFlow(makeProduction(guests) as never, strom as never);
+
+    expect(strom.created).toHaveLength(2);
+    const program = strom.created[0]!;
+    const pBlocks = program['blocks'] as Array<Record<string, unknown>>;
+    const pLinks = program['links'] as Array<{ from: string; to: string }>;
+    const mixerId = auxMixer(pBlocks)['id'] as string;
+
+    // One bridge output per audio channel, fed from the same pad as that mixer channel.
+    const bridgeOuts = pBlocks.filter((b) => b['block_definition_id'] === 'builtin.audio_bridge_output');
+    expect(bridgeOuts).toHaveLength(3);
+    for (let ch = 0; ch < 3; ch++) {
+      const mixerFeed = pLinks.find((l) => l.to === `${mixerId}:input_${ch + 1}`)!;
+      const bridge = bridgeOuts.find((b) => (b['properties'] as Record<string, unknown>)['channel'] === `fast-test-onl-${ch}`)!;
+      expect(pLinks).toContainEqual({ from: mixerFeed.from, to: `${bridge['id'] as string}:audio_in` });
+    }
+
+    const conv = strom.created[1]!;
+    expect((conv['properties'] as Record<string, unknown>)['description']).toBe('conv:flow-program');
+    const cBlocks = conv['blocks'] as Array<Record<string, unknown>>;
+    const router = cBlocks.find((b) => b['block_definition_id'] === 'builtin.liveaudiorouter')!;
+    const rp = router['properties'] as Record<string, unknown>;
+    expect(rp['num_inputs']).toBe(3);
+    expect(rp['num_outputs']).toBe(1);
+    // video_in_1 is audio channel 1: its own voice is left out of its feed.
+    expect(JSON.parse(rp['routing_matrix'] as string)).toEqual({
+      i0c0: ['o0c0'], i0c1: ['o0c1'], i2c0: ['o0c0'], i2c1: ['o0c1'],
+    });
+    const fast = cBlocks.find((b) => b['block_definition_id'] === 'builtin.whep_output')!;
+    expect(fast['properties']).toMatchObject({ endpoint_id: 'whep-fast-1-test-onl', num_audio_tracks: 1, num_video_tracks: 0 });
+
+    // Only the lowLatency guest gets a fast feed; both keep their picture feed.
+    expect(result.fastWhepEntries).toEqual([{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-test-onl' }]);
+    expect(result.returnWhepEntries.map((e) => e.mixerInput)).toEqual(['video_in_1', 'video_in_2']);
+  });
+
+  it('builds no conversation flow when no guest asks for a fast feed', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeTwoFlowStrom();
+    const result = await activateStromFlow(
+      makeProduction(guests.map(({ returnFeed, ...g }) => (returnFeed ? { ...g, returnFeed: { synced: returnFeed.synced } } : g))) as never,
+      strom as never,
+    );
+    expect(strom.created).toHaveLength(1);
+    const blocks = strom.created[0]!['blocks'] as Array<Record<string, unknown>>;
+    expect(blocks.some((b) => b['block_definition_id'] === 'builtin.audio_bridge_output')).toBe(false);
+    expect(result.fastWhepEntries).toEqual([]);
+  });
+
+  it('keeps the program running when the conversation flow cannot start', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeTwoFlowStrom({ conversationStartFails: true });
+    const result = await activateStromFlow(makeProduction(guests) as never, strom as never);
+    expect(result.flowId).toBe('flow-program');
+    expect(result.fastWhepEntries).toEqual([]);
+    expect(strom.flows.delete).toHaveBeenCalledWith('flow-conv');
+    expect(strom.flows.delete).not.toHaveBeenCalledWith('flow-program');
+  });
+});
+
+describe('deactivateStromFlow — conversation flow', () => {
+  it('removes the conversation flow of this program flow only', async () => {
+    const { deactivateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = {
+      flows: {
+        list: vi.fn().mockResolvedValue({
+          flows: [
+            { id: 'flow-program', properties: { description: 'prod:prod-a' } },
+            { id: 'flow-conv', properties: { description: 'conv:flow-program' } },
+            { id: 'flow-other-conv', properties: { description: 'conv:flow-other' } },
+          ],
+        }),
+        stop: vi.fn().mockResolvedValue({}),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+    };
+    await deactivateStromFlow('flow-program', strom as never);
+    const deleted = strom.flows.delete.mock.calls.map((c) => c[0]);
+    expect(deleted).toEqual(['flow-conv', 'flow-program']);
+  });
+});

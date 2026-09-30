@@ -5,6 +5,8 @@ import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { stoppedStatus } from '../lib/production-health.js';
 import type { ProductionDoc } from '../db/types.js';
+import { conversationFlowOwner } from '../lib/fast-returns.js';
+import { deactivateStromFlow } from '../lib/flow-generator.js';
 
 /**
  * Startup reconciliation: cross-reference each production's stored stromFlowId
@@ -30,15 +32,26 @@ export async function reconcileProductionStatuses(
 
   let liveFlows: import('../lib/strom.js').Flow[];
   let liveFlowIds: Set<string>;
+  let strom: StromClient;
   try {
     const stromToken = await getStromToken(config.stromToken);
-    const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+    strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
     ({ flows: liveFlows } = await strom.flows.list());
     liveFlowIds = new Set(liveFlows.map((f) => f.id));
     log.debug({ count: liveFlowIds.size }, '[reconcile] Fetched Strom flows');
   } catch (err) {
     log.warn({ err }, '[reconcile] Could not reach Strom — skipping');
     return;
+  }
+
+  // A conversation flow (fast return feeds) lives only as long as its program
+  // flow; remove any whose program flow is gone.
+  for (const flow of liveFlows) {
+    const owner = conversationFlowOwner((flow.properties as { description?: string } | undefined)?.description);
+    if (owner && !liveFlowIds.has(owner)) {
+      await deactivateStromFlow(flow.id, strom);
+      log.info({ flowId: flow.id, programFlowId: owner }, '[reconcile] Removed orphaned conversation flow');
+    }
   }
 
   // Build a map from production ID → flow ID using the description tag every

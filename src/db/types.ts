@@ -420,6 +420,8 @@ export interface GuestSessionDoc {
    * caller-supplied :sessionId for another guest's feed.
    */
   returnWhepSessionId?: string;
+  /** Strom WHEP session id of this guest's most recent fast return feed; same role as `returnWhepSessionId`. */
+  fastWhepSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -449,9 +451,9 @@ export interface ProductionSourceAssignment {
    * issue #299, `docs/specs/guest-calling-intercom.md` §"Return feed design").
    * The return belongs to the assignment, not the guest session, so a rejoin on
    * the same `mixerInput` keeps it and crew-added contributors can have one.
-   * Additive and defaulted-absent; POPULATED BY A LATER SUB-ISSUE (return /
-   * mix-minus wiring) — declared here only so the data model is stable.
-   * v1 accepts `lowLatency: false` only.
+   * Additive and defaulted-absent. `lowLatency: true` also builds an audio-only
+   * fast feed of the same mix-minus in a separate conversation flow
+   * (`src/lib/fast-returns.ts`), ahead of the picture by design.
    */
   returnFeed?: { synced: 'program' | 'program-minus'; lowLatency?: boolean };
 }
@@ -573,6 +575,12 @@ export interface ProductionDoc {
   returnBuses?: Array<{ mixerInput: string; auxBus: number; ownChannel: number; mode: 'program' | 'program-minus' }>;
   /** Per-guest return WHEP output URLs — set when flow reaches 'playing', cleared on deactivate */
   returnWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
+  /**
+   * Per-guest audio-only fast return URLs (`returnFeed.lowLatency`), in the
+   * production's conversation flow — set when the flow reaches 'playing',
+   * cleared on deactivate. Absent when the conversation flow did not start.
+   */
+  fastWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
   /**
    * Open Intercom production/line grouping id — set when guest calling is
    * enabled for this production (epic #208, issue #299,
