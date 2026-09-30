@@ -15,11 +15,15 @@ const AudioPatch = z.object({
 
 const MIXER_BLOCK_TYPE = 'builtin.mixer';
 
+class StromTimeoutError extends Error {
+  constructor() { super('Strom request timed out'); }
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Strom request timed out')), ms),
+      setTimeout(() => reject(new StromTimeoutError()), ms),
     ),
   ]);
 }
@@ -169,10 +173,12 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
             5000,
           );
         } catch (err) {
-          undoFast?.();
+          // A timed-out write may still have been applied; keep the fast feeds with it.
+          if (!(err instanceof StromTimeoutError)) undoFast?.();
+          else if (undoFast) void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
           throw err;
         }
-        if (undoFast) await syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+        if (undoFast) void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };

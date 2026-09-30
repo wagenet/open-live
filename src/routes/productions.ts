@@ -482,7 +482,7 @@ async function runActivationFlow(
         // Mutes and fader moves made while the flow was starting reached the mixer
         // but not the router, which was built with every channel open.
         confirmFastFeedState(productionId);
-        await syncFastFeedRouter(productionId, activation.fastFeedRouter, strom, { onlyIfChanged: true });
+        void syncFastFeedRouter(productionId, activation.fastFeedRouter, strom, { onlyIfChanged: true });
         notifyProductionActivated(productionId);
         // Emit the PRODUCTION_STATUS lifecycle event for the active transition
         // (spec §3). Flow is playing, so all assigned outputs derive as healthy.

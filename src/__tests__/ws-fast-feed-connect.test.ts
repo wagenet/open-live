@@ -56,6 +56,12 @@ const MIXER_PATH = `/api/flows/${FLOW_ID}/blocks/${MIXER_ID}/properties`;
 
 const patches: Array<{ path: string; body: Record<string, unknown> }> = [];
 let mixerFails = false;
+/** Refuse writes through the REST audio route (element properties). */
+let elementFails = false;
+/** Answer the next reset write (the first connect's) this late (ms); Strom applies it on arrival. */
+let slowNextResetReplyMs = 0;
+/** Answer the next REST audio write this late (ms); Strom applies it on arrival. */
+let slowNextElementReplyMs = 0;
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -65,9 +71,21 @@ const stromServer: Server = createServer((req, res) => {
     if (req.method === 'PATCH' || (req.method === 'POST' && req.url?.includes('/elements/'))) {
       patches.push({ path: req.url ?? '', body });
     }
-    if (mixerFails && req.method === 'PATCH' && req.url === MIXER_PATH) {
+    const isElementWrite = req.method === 'PATCH' && (req.url ?? '').includes('/elements/');
+    if ((mixerFails && req.method === 'PATCH' && req.url === MIXER_PATH) || (elementFails && isElementWrite)) {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'block gone' }));
+      return;
+    }
+    let delay = 0;
+    const props = body['properties'] as Record<string, unknown> | undefined;
+    if (req.url === MIXER_PATH && props?.['main_fader'] !== undefined) { delay = slowNextResetReplyMs; slowNextResetReplyMs = 0; }
+    if (isElementWrite) { delay = slowNextElementReplyMs; slowNextElementReplyMs = 0; }
+    if (delay > 0) {
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      }, delay);
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -90,7 +108,7 @@ afterAll(() => stromServer.close());
 
 const { buildServer } = await import('../server.js');
 const { handleMessage, clearAudioState } = await import('../ws/controller.js');
-const { confirmFastFeedState } = await import('../services/fast-feed-state.js');
+const { confirmFastFeedState, whenFastFeedRouterIdle } = await import('../services/fast-feed-state.js');
 const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
 
 const PROD = 'prod-fast-connect';
@@ -113,7 +131,11 @@ function makeProduction() {
 
 let app: FastifyInstance;
 const fakeWs = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
-const send = (msg: Record<string, unknown>) => handleMessage(PROD, fakeWs, JSON.stringify(msg), { audioBlockId: MIXER_ID });
+// Router writes go out in the background; each helper waits for them.
+const send = async (msg: Record<string, unknown>) => {
+  await handleMessage(PROD, fakeWs, JSON.stringify(msg), { audioBlockId: MIXER_ID });
+  await whenFastFeedRouterIdle(PROD);
+};
 const routerMatrices = () =>
   patches.filter((p) => p.path === ROUTER_PATH).map((p) => (p.body['properties'] as Record<string, unknown>)['routing_matrix']);
 
@@ -128,11 +150,21 @@ async function connectOnce(): Promise<void> {
     ws.on('open', () => setTimeout(resolve, 800));
   });
   ws.close();
+  await whenFastFeedRouterIdle(PROD);
+}
+
+async function patchAudio(elementId: string, payload: Record<string, unknown>) {
+  const res = await app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/${elementId}`, payload });
+  await whenFastFeedRouterIdle(PROD);
+  return res;
 }
 
 beforeEach(async () => {
   patches.length = 0;
   mixerFails = false;
+  elementFails = false;
+  slowNextResetReplyMs = 0;
+  slowNextElementReplyMs = 0;
   productionDocs.clear();
   productionDocs.set(PROD, makeProduction());
   clearAudioState(PROD);
@@ -159,7 +191,7 @@ describe('fast feeds after a server restart', () => {
   });
 
   it('reopens a channel muted through the REST route before anyone connected', async () => {
-    await app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/ch1`, payload: { property: 'mute', value: true } });
+    await patchAudio('ch1', { property: 'mute', value: true });
     patches.length = 0;
     // The first connect sets every ch<N>_mute back to false on the mixer.
     await connectOnce();
@@ -172,7 +204,7 @@ describe('fast feeds after a server restart', () => {
     patches.length = 0;
 
     // The mixer still has ch3 off; a router write from empty state would reopen it.
-    await app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/ch1`, payload: { property: 'volume', value: 0.5 } });
+    await patchAudio('ch1', { property: 'volume', value: 0.5 });
     expect(routerMatrices()).toEqual([]);
 
     await connectOnce();
@@ -189,6 +221,18 @@ describe('fast feeds after a server restart', () => {
     expect(routerMatrices()).toEqual([]);
   });
 
+  it('keeps a crew change made while the first connect\'s reset is on its way', async () => {
+    clearAudioState(PROD);
+    patches.length = 0;
+    slowNextResetReplyMs = 300;
+    const connecting = connectOnce();
+    await vi.waitFor(() => expect(patches.some((p) => p.path === MIXER_PATH)).toBe(true), { timeout: 3000 });
+    // Another operator mutes ch1 after the reset reached the mixer, before its reply.
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await connecting;
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
+  });
+
   it('leaves the router alone on a later connect', async () => {
     await connectOnce();
     await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
@@ -199,15 +243,26 @@ describe('fast feeds after a server restart', () => {
 });
 
 describe('fast feeds and the REST audio route', () => {
-  const patchAudio = (elementId: string, payload: Record<string, unknown>) =>
-    app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/${elementId}`, payload });
-
   it('a mute takes the channel out of the fast feeds, and unmuting brings it back', async () => {
     expect((await patchAudio('ch1', { property: 'mute', value: true })).statusCode).toBe(200);
     expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([0]))]);
     expect((await patchAudio('ch1', { property: 'mute', value: false })).statusCode).toBe(200);
     expect(routerMatrices()[1]).toBe(fastRoutingMatrix(3, [1]));
   });
+
+  it('a mute Strom refused leaves the fast feeds alone', async () => {
+    elementFails = true;
+    expect((await patchAudio('ch1', { property: 'mute', value: true })).statusCode).toBe(500);
+    elementFails = false;
+    await patchAudio('ch3', { property: 'mute', value: true });
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]))]);
+  });
+
+  it('a mute whose write timed out stays in the fast feeds, since Strom may have applied it', async () => {
+    slowNextElementReplyMs = 5500;
+    expect((await patchAudio('ch1', { property: 'mute', value: true })).statusCode).toBe(500);
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
+  }, 10_000);
 
   it('a volume becomes the channel\'s level in the fast feeds', async () => {
     expect((await patchAudio('ch3', { property: 'volume', value: 0.25 })).statusCode).toBe(200);

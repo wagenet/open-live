@@ -1083,7 +1083,7 @@ async function applyAudioFollow(
     await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
       .catch((err) => { mixerOk = false; console.warn('[controller] audio follow error:', String(err)); });
   }
-  if (mixerOk) await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+  if (mixerOk) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
   else undoFast();
 }
 
@@ -1926,7 +1926,7 @@ export async function handleMessage(
                 undoFast?.();
                 throw err;
               }
-              if (undoFast) await syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
+              if (undoFast) void syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
               broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
@@ -1974,7 +1974,7 @@ export async function handleMessage(
             undoFast?.();
             throw err;
           }
-          if (undoFast) await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+          if (undoFast) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
@@ -2018,7 +2018,7 @@ export async function handleMessage(
                 ),
               },
             }).catch((err) => { mixerOk = false; console.warn('[controller] AFV_SET routing error:', err); });
-            if (mixerOk) await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+            if (mixerOk) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
             else undoFast();
           }
         }
@@ -2809,14 +2809,15 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
+              // The reset opens every channel at unity, so the fast feeds start from
+              // that; a crew change sent while it is on its way lands after it and is
+              // kept. The router may still hold what the crew set before a restart.
+              clearFastFeedState(id);
               const initOk = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
                 .then(() => true, (err) => { console.warn('[controller] init channel props error:', err); return false; });
-              // Every channel is now open at unity on the mixer; the router may still
-              // hold what the crew set before a server restart.
-              clearFastFeedState(id);
               if (initOk) {
                 confirmFastFeedState(id);
-                await syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
+                void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
               }
             }
             // Restore fader levels and mute state.

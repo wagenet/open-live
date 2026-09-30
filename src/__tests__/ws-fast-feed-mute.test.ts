@@ -108,7 +108,7 @@ afterAll(() => {
 
 // Imported after STROM_URL is set so config picks up the throwaway server.
 const { handleMessage, clearAudioState } = await import('../ws/controller.js');
-const { confirmFastFeedState } = await import('../services/fast-feed-state.js');
+const { confirmFastFeedState, whenFastFeedRouterIdle } = await import('../services/fast-feed-state.js');
 const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
 const { setTally } = await import('../services/tally.service.js');
 
@@ -144,7 +144,11 @@ function makeProduction(withRouter = true) {
 const ws = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
 // One controller connection per test: rate limiting is per connection.
 let ctx: { audioBlockId: string } = { audioBlockId: MIXER_ID };
-const send = (msg: Record<string, unknown>) => handleMessage(PROD, ws, JSON.stringify(msg), ctx);
+// Router writes go out in the background; `send` waits for them too.
+const send = async (msg: Record<string, unknown>) => {
+  await handleMessage(PROD, ws, JSON.stringify(msg), ctx);
+  await whenFastFeedRouterIdle(PROD);
+};
 const routerMatrices = () =>
   patches.filter((p) => p.path === ROUTER_PATH).map((p) => (p.body['properties'] as Record<string, unknown>)['routing_matrix']);
 
@@ -215,9 +219,9 @@ describe('crew mutes reach the fast return feeds', () => {
     await send({ type: 'CUT', mixerInput: 'video_in_3' });
     await send({ type: 'CUT', mixerInput: 'video_in_1' });
     // applyAudioFollow is fired without awaiting; let both cuts' requests land.
+    // Each cut syncs the router once its mixer write is answered.
     await vi.waitFor(() => expect(routerMatrices()).toHaveLength(2), { timeout: 2000 });
-    const mixerWrites = patches.filter((p) => p.path === MIXER_PATH).map((p) => p.body['properties'] as Record<string, unknown>);
-    expect(mixerWrites.at(-1)).toMatchObject({ ch1_to_main: true, ch3_to_main: false });
+    await whenFastFeedRouterIdle(PROD);
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
   });
 
@@ -275,6 +279,27 @@ describe('crew mutes reach the fast return feeds', () => {
     ]);
     expect(maxRouterInFlight).toBe(1);
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+  });
+
+  it('tells the crew about a mute without waiting for a slow router write', async () => {
+    slowNextRouterReplyMs = 1000;
+    const started = Date.now();
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true }), ctx);
+    expect(mockBroadcast).toHaveBeenCalledWith(PROD, { type: 'AUDIO_STATE', elementId: 'ch1', property: 'mute', value: true });
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true }), ctx);
+    expect(mockBroadcast).toHaveBeenCalledWith(PROD, { type: 'AUDIO_STATE', elementId: 'ch3', property: 'mute', value: true });
+    expect(Date.now() - started).toBeLessThan(500);
+    await whenFastFeedRouterIdle(PROD);
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+  });
+
+  it('sends one router write for changes made while another is on its way', async () => {
+    slowNextRouterReplyMs = 150;
+    for (const elementId of ['ch1', 'ch3', 'ch2']) {
+      await handleMessage(PROD, ws, JSON.stringify({ type: 'AUDIO_SET', elementId, property: 'mute', value: true }), ctx);
+    }
+    await whenFastFeedRouterIdle(PROD);
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([0])), fastRoutingMatrix(3, [1], new Set([0, 1, 2]))]);
   });
 
   it('sends nothing to the router until the state is known to match the mixer', async () => {
