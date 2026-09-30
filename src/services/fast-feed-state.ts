@@ -162,6 +162,24 @@ export function recordFastFeedChanges(productionId: string, changes: Iterable<Fa
 }
 
 /**
+ * Takes the production's channel state from a read of the mixer. A change still
+ * waiting on the mixer's answer stays newer than the read, since the read may
+ * have reached Strom before it.
+ */
+export function fillFastFeedFromMixer(productionId: string, changes: Iterable<FastFeedChange>): void {
+  const s = stateFor(productionId);
+  for (const c of changes) {
+    const kind = kindOf(c);
+    const key = `${kind}:${c.channel}`;
+    const value = 'toMain' in c ? c.toMain : 'muted' in c ? c.muted : c.gain;
+    const entry = s.changes.get(key);
+    if (entry) entry.settled = { version: 0, value };
+    else s.changes.set(key, { settled: { version: 0, value }, unanswered: [] });
+    write(s, kind, c.channel, entry ? newest(entry).value : value);
+  }
+}
+
+/**
  * Forgets the production's channel state (every channel open at unity), that it
  * matched the mixer, and its router writes: one still on its way is not waited
  * for, and one not yet sent is dropped.

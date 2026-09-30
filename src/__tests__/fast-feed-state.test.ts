@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   recordFastFeedChanges,
+  fillFastFeedFromMixer,
   confirmFastFeedState,
   clearFastFeedState,
   syncFastFeedRouter,
@@ -154,5 +155,18 @@ describe('a channel\'s value as the mixer answers its changes', () => {
     mute2.undo();
     unmute2.undo();
     expect(closed()).toBe(false);
+  });
+
+  it('keeps a change still waiting on the mixer over a read of the mixer, until the mixer answers', () => {
+    const mute = recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]);
+    fillFastFeedFromMixer(PROD, [{ channel: 0, toMain: true }]);
+    expect(closed()).toBe(true);
+    mute.undo();
+    expect(closed()).toBe(false);
+
+    const mute2 = recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]);
+    fillFastFeedFromMixer(PROD, [{ channel: 0, toMain: true }]);
+    mute2.settle();
+    expect(closed()).toBe(true);
   });
 });

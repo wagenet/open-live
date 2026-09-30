@@ -264,6 +264,24 @@ describe('fast feeds after a server restart', () => {
     expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([1]), new Map([[0, 1], [1, 1], [2, 1]]))]);
   });
 
+  it('keeps a mute on its way to the mixer when a later connect reads the mixer from before it', async () => {
+    clearAudioState(PROD);
+    mixerFails = true;
+    await connectOnce(); // the pipeline reads as empty
+    mixerFails = false;
+    patches.length = 0;
+
+    // The read reaches Strom before the mute does, so ch1 reads as open.
+    mixerReadProps = mixerProps({});
+    slowNextElementReplyMs = 1500;
+    const muting = patchAudio('ch1', { property: 'mute', value: true });
+    await vi.waitFor(() => expect(patches.some((p) => p.path.includes('/elements/'))).toBe(true), { timeout: 3000 });
+    await connectOnce();
+    expect((await muting).statusCode).toBe(200);
+    await whenFastFeedRouterIdle(PROD);
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0]), new Map([[0, 1], [1, 1], [2, 1]])));
+  }, 15_000);
+
   it('keeps a crew change made while the first connect\'s reset is on its way', async () => {
     clearAudioState(PROD);
     patches.length = 0;

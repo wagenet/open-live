@@ -26,7 +26,7 @@ import {
   type PersistedReturnBus,
   type ReturnMode,
 } from '../lib/return-feeds.js';
-import { recordFastFeedChanges, clearFastFeedState, confirmFastFeedState, syncFastFeedRouter, type FastFeedChange, type FastFeedRecord } from '../services/fast-feed-state.js';
+import { recordFastFeedChanges, fillFastFeedFromMixer, clearFastFeedState, confirmFastFeedState, syncFastFeedRouter, type FastFeedChange, type FastFeedRecord } from '../services/fast-feed-state.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -2863,7 +2863,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               }
               if (numChannels > 0 && changes.length === numChannels * 3) {
                 fastFeedAwaitingMixerRead.delete(id);
-                recordFastFeedChanges(id, changes).settle();
+                fillFastFeedFromMixer(id, changes);
                 confirmFastFeedState(id);
                 void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
               }
