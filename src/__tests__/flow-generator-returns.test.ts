@@ -292,6 +292,30 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     expect(result.fastWhepEntries).toEqual([]);
   });
 
+  it('builds no fast feed past the router\'s 8 audio channels, and builds one at 8, with a fast feed on every channel', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const fast = { synced: 'program-minus' as const, lowLatency: true };
+    const channels = (n: number, fastFrom: number) =>
+      Array.from({ length: n }, (_, i) =>
+        i + 1 >= fastFrom ? { sourceId: 'Whip', mixerInput: `video_in_${i + 1}`, returnFeed: fast } : { sourceId: '__test1__', mixerInput: `video_in_${i + 1}` });
+
+    for (const sources of [channels(9, 9), channels(9, 1)]) {
+      const strom = makeTwoFlowStrom();
+      const result = await activateStromFlow(makeProduction(sources) as never, strom as never);
+      expect(strom.created).toHaveLength(1);
+      const blocks = strom.created[0]!['blocks'] as Array<Record<string, unknown>>;
+      expect(blocks.some((b) => b['block_definition_id'] === 'builtin.audio_bridge_output')).toBe(false);
+      expect(result.fastWhepEntries).toEqual([]);
+    }
+
+    const strom = makeTwoFlowStrom();
+    const result = await activateStromFlow(makeProduction(channels(8, 1)) as never, strom as never);
+    const router = (strom.created[1]!['blocks'] as Array<Record<string, unknown>>)
+      .find((b) => b['block_definition_id'] === 'builtin.liveaudiorouter')!;
+    expect(router['properties']).toMatchObject({ num_inputs: 8, num_outputs: 8 });
+    expect(result.fastWhepEntries).toHaveLength(8);
+  });
+
   it('keeps the program running when the conversation flow cannot start', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
     const strom = makeTwoFlowStrom({ conversationStartFails: true });

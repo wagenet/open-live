@@ -15,6 +15,7 @@ import { listenerPortRequest } from '../services/listener-ports.js';
 import {
   conversationFlowDescription,
   conversationFlowOwner,
+  FAST_ROUTER_MAX_STREAMS,
   planFastReturns,
   removeOrphanConversationFlows,
   type FastFeedRouter,
@@ -1035,12 +1036,20 @@ export async function activateStromFlow(
       if (m) channelSources[parseInt(m[1]!, 10) - 1] = link['from'] as string;
     }
     const dense = channelSources.length > 0 && channelSources.every((pad) => typeof pad === 'string');
-    fastPlan = dense ? planFastReturns(endpointSuffix, channelSources, fastRequests, fastReturnLatencyMs) : null;
-    if (fastPlan) {
-      flow.blocks.push(...fastPlan.programBlocks);
-      flow.links.push(...fastPlan.programLinks);
-    } else {
+    if (!dense) {
       console.warn('[flow-generator] Fast return feeds skipped: an audio channel has no source link');
+    } else if (channelSources.length > FAST_ROUTER_MAX_STREAMS) {
+      // Every fast feed's guest is one of these channels, so the outputs fit too.
+      console.warn(
+        `[flow-generator] Fast return feeds skipped: ${channelSources.length} audio channels, ` +
+        `but the router takes at most ${FAST_ROUTER_MAX_STREAMS}`,
+      );
+    } else {
+      fastPlan = planFastReturns(endpointSuffix, channelSources, fastRequests, fastReturnLatencyMs);
+      if (fastPlan) {
+        flow.blocks.push(...fastPlan.programBlocks);
+        flow.links.push(...fastPlan.programLinks);
+      }
     }
   }
 

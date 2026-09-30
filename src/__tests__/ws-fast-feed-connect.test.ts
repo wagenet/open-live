@@ -55,6 +55,7 @@ const ROUTER_PATH = `/api/flows/${CONV_FLOW_ID}/blocks/${ROUTER_ID}/properties`;
 const MIXER_PATH = `/api/flows/${FLOW_ID}/blocks/${MIXER_ID}/properties`;
 
 const patches: Array<{ path: string; body: Record<string, unknown> }> = [];
+let mixerFails = false;
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
   req.on('data', (c: Buffer) => chunks.push(c));
@@ -63,6 +64,11 @@ const stromServer: Server = createServer((req, res) => {
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     if (req.method === 'PATCH' || (req.method === 'POST' && req.url?.includes('/elements/'))) {
       patches.push({ path: req.url ?? '', body });
+    }
+    if (mixerFails && req.method === 'PATCH' && req.url === MIXER_PATH) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'block gone' }));
+      return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     if (req.method === 'GET' && req.url === `/api/flows/${FLOW_ID}`) {
@@ -84,6 +90,7 @@ afterAll(() => stromServer.close());
 
 const { buildServer } = await import('../server.js');
 const { handleMessage, clearAudioState } = await import('../ws/controller.js');
+const { confirmFastFeedState } = await import('../services/fast-feed-state.js');
 const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
 
 const PROD = 'prod-fast-connect';
@@ -125,9 +132,12 @@ async function connectOnce(): Promise<void> {
 
 beforeEach(async () => {
   patches.length = 0;
+  mixerFails = false;
   productionDocs.clear();
   productionDocs.set(PROD, makeProduction());
   clearAudioState(PROD);
+  // As after a controller's first connect: the router may follow the mixer.
+  confirmFastFeedState(PROD);
   app = await buildServer();
   await app.listen({ port: 0, host: '127.0.0.1' });
 });
@@ -154,6 +164,29 @@ describe('fast feeds after a server restart', () => {
     // The first connect sets every ch<N>_mute back to false on the mixer.
     await connectOnce();
     expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1])]);
+  });
+
+  it('holds a REST change made after a restart until the first connect resets the mixer', async () => {
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    clearAudioState(PROD);
+    patches.length = 0;
+
+    // The mixer still has ch3 off; a router write from empty state would reopen it.
+    await app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/ch1`, payload: { property: 'volume', value: 0.5 } });
+    expect(routerMatrices()).toEqual([]);
+
+    await connectOnce();
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1])]);
+  });
+
+  it('leaves the router alone when the first connect could not reset the mixer', async () => {
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    clearAudioState(PROD);
+    patches.length = 0;
+    mixerFails = true;
+    await connectOnce();
+    expect(patches.some((p) => p.path === MIXER_PATH)).toBe(true);
+    expect(routerMatrices()).toEqual([]);
   });
 
   it('leaves the router alone on a later connect', async () => {

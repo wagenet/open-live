@@ -158,17 +158,21 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
 
         const elemId = isMain ? `${mixerBlock2.id}:main_volume` : `${mixerBlock2.id}:volume_${(ch as number) - 1}`;
         const property = body.property === 'volume' ? 'volume' : 'mute';
-        await withTimeout(
-          strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
-          5000,
-        );
-        if (ch !== null) {
-          const channel = ch - 1;
-          recordFastFeedChanges(req.params.id, [
-            property === 'mute' ? { channel, muted: body.value === true } : { channel, gain: Number(body.value) },
-          ]);
-          await syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+        const undoFast = ch !== null
+          ? recordFastFeedChanges(req.params.id, [
+            property === 'mute' ? { channel: ch - 1, muted: body.value === true } : { channel: ch - 1, gain: Number(body.value) },
+          ])
+          : undefined;
+        try {
+          await withTimeout(
+            strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
+            5000,
+          );
+        } catch (err) {
+          undoFast?.();
+          throw err;
         }
+        if (undoFast) await syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };

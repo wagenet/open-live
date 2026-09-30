@@ -4,9 +4,17 @@
  *
  * The fast feed taps each channel's source before the mixer, so the router has to
  * copy the crew's routing (mute / audio-follow-video via `to_main`), the channel
- * mute set through the REST audio route, and the fader level. State is recorded
- * even while the production has no router yet, so a change made while the
- * production is still starting is applied once the router exists.
+ * mute set through the REST audio route, and the fader level.
+ *
+ * Callers record a change when they decide it, before the mixer write, so the
+ * state follows the order changes were sent in rather than the order Strom
+ * answered; a change the mixer rejected is undone. Router writes go out one at a
+ * time per production and each carries the state current when it is sent.
+ *
+ * State is only written to a router once it is known to match the mixer: after
+ * the first controller connect (which resets every channel) or after activation
+ * (a new router and a new mixer both start with every channel open). Until then,
+ * changes are recorded but not sent.
  */
 
 import { fastRoutingMatrix, type FastFeedRouter } from '../lib/fast-returns.js';
@@ -22,35 +30,86 @@ interface ChannelState {
   offProgram: Set<number>;
   muted: Set<number>;
   gains: Map<number, number>;
+  /** Version of the last change per `<kind>:<channel>`, so an undo never reverts a newer change. */
+  versions: Map<string, number>;
+  nextVersion: number;
 }
 
 const stateByProduction = new Map<string, ChannelState>();
+const confirmedProductions = new Set<string>();
+const pendingWrite = new Map<string, Promise<void>>();
 
 function stateFor(productionId: string): ChannelState {
   let s = stateByProduction.get(productionId);
-  if (!s) stateByProduction.set(productionId, (s = { offProgram: new Set(), muted: new Set(), gains: new Map() }));
+  if (!s) {
+    s = { offProgram: new Set(), muted: new Set(), gains: new Map(), versions: new Map(), nextVersion: 1 };
+    stateByProduction.set(productionId, s);
+  }
   return s;
 }
 
-/** Records `changes`; the router is written by `syncFastFeedRouter`. */
-export function recordFastFeedChanges(productionId: string, changes: Iterable<FastFeedChange>): void {
-  const s = stateFor(productionId);
-  for (const change of changes) {
-    if ('toMain' in change) {
-      if (change.toMain) s.offProgram.delete(change.channel);
-      else s.offProgram.add(change.channel);
-    } else if ('muted' in change) {
-      if (change.muted) s.muted.add(change.channel);
-      else s.muted.delete(change.channel);
-    } else {
-      s.gains.set(change.channel, change.gain);
-    }
+type Kind = 'toMain' | 'muted' | 'gain';
+type Value = boolean | number | undefined;
+
+function kindOf(change: FastFeedChange): Kind {
+  return 'toMain' in change ? 'toMain' : 'muted' in change ? 'muted' : 'gain';
+}
+
+function read(s: ChannelState, kind: Kind, ch: number): Value {
+  if (kind === 'toMain') return !s.offProgram.has(ch);
+  if (kind === 'muted') return s.muted.has(ch);
+  return s.gains.get(ch);
+}
+
+function write(s: ChannelState, kind: Kind, ch: number, value: Value): void {
+  if (kind === 'toMain') {
+    if (value) s.offProgram.delete(ch);
+    else s.offProgram.add(ch);
+  } else if (kind === 'muted') {
+    if (value) s.muted.add(ch);
+    else s.muted.delete(ch);
+  } else if (value === undefined) {
+    s.gains.delete(ch);
+  } else {
+    s.gains.set(ch, value as number);
   }
 }
 
-/** Forgets the production's channel state: every channel open at unity. */
+/**
+ * Records `changes` and returns a function that undoes them, for when the mixer
+ * write they belong to fails. The undo skips any channel changed again since.
+ * The router is written by `syncFastFeedRouter`.
+ */
+export function recordFastFeedChanges(productionId: string, changes: Iterable<FastFeedChange>): () => void {
+  const s = stateFor(productionId);
+  const undo: Array<{ key: string; kind: Kind; channel: number; previous: Value; version: number }> = [];
+  for (const change of changes) {
+    const kind = kindOf(change);
+    const key = `${kind}:${change.channel}`;
+    const version = s.nextVersion++;
+    undo.push({ key, kind, channel: change.channel, previous: read(s, kind, change.channel), version });
+    const value = 'toMain' in change ? change.toMain : 'muted' in change ? change.muted : change.gain;
+    write(s, kind, change.channel, value);
+    s.versions.set(key, version);
+  }
+  return () => {
+    for (const u of undo.reverse()) {
+      if (s.versions.get(u.key) !== u.version) continue;
+      write(s, u.kind, u.channel, u.previous);
+      s.versions.delete(u.key);
+    }
+  };
+}
+
+/** Forgets the production's channel state (every channel open at unity) and that it matched the mixer. */
 export function clearFastFeedState(productionId: string): void {
   stateByProduction.delete(productionId);
+  confirmedProductions.delete(productionId);
+}
+
+/** Marks the production's channel state as matching its mixer, so it may be written to the router. */
+export function confirmFastFeedState(productionId: string): void {
+  confirmedProductions.add(productionId);
 }
 
 /** The router's `routing_matrix` for the production's current channel state. */
@@ -61,8 +120,9 @@ export function fastFeedMatrix(productionId: string, router: Pick<FastFeedRouter
 }
 
 /**
- * Writes the production's channel state into its fast feeds' router. A failure
- * is logged and costs only the fast feeds' copy of the change.
+ * Writes the production's channel state into its fast feeds' router, after any
+ * write already on its way. A failure is logged and costs only the fast feeds'
+ * copy of the change.
  *
  * @param onlyIfChanged skip the write when nothing has been recorded (the router
  *   was built with every channel open at unity)
@@ -73,9 +133,15 @@ export async function syncFastFeedRouter(
   strom: Pick<StromClient, 'flows'>,
   { onlyIfChanged = false }: { onlyIfChanged?: boolean } = {},
 ): Promise<void> {
-  if (!router) return;
+  if (!router || !confirmedProductions.has(productionId)) return;
   if (onlyIfChanged && !stateByProduction.has(productionId)) return;
-  const routing_matrix = fastFeedMatrix(productionId, router);
-  await strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } })
-    .catch((err) => console.warn('[fast-feed] router update error:', String(err)));
+  const previous = pendingWrite.get(productionId) ?? Promise.resolve();
+  const next = previous.then(async () => {
+    const routing_matrix = fastFeedMatrix(productionId, router);
+    await strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } })
+      .catch((err) => console.warn('[fast-feed] router update error:', String(err)));
+  });
+  pendingWrite.set(productionId, next);
+  await next;
+  if (pendingWrite.get(productionId) === next) pendingWrite.delete(productionId);
 }

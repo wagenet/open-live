@@ -52,6 +52,14 @@ const ROUTER_PATH = `/api/flows/${CONV_FLOW_ID}/blocks/${ROUTER_ID}/properties`;
 
 const patches: Array<{ path: string; body: Record<string, unknown> }> = [];
 let routerFails = false;
+let mixerFails = false;
+/** Answer the next mixer write this late (ms); Strom applies it on arrival either way. */
+let slowNextMixerReplyMs = 0;
+/** Refuse the next mixer write, this late (ms). */
+let failNextMixerAfterMs: number | null = null;
+let slowNextRouterReplyMs = 0;
+let routerInFlight = 0;
+let maxRouterInFlight = 0;
 
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -60,13 +68,32 @@ const stromServer: Server = createServer((req, res) => {
     const raw = Buffer.concat(chunks).toString('utf8');
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
     if (req.method === 'PATCH') patches.push({ path: req.url ?? '', body });
-    if (routerFails && req.url === ROUTER_PATH) {
+    if ((routerFails && req.url === ROUTER_PATH) || (mixerFails && req.url === MIXER_PATH)) {
       res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'router gone' }));
+      res.end(JSON.stringify({ error: 'block gone' }));
       return;
     }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ success: true }));
+    if (req.url === MIXER_PATH && failNextMixerAfterMs !== null) {
+      const after = failNextMixerAfterMs;
+      failNextMixerAfterMs = null;
+      setTimeout(() => {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'block gone' }));
+      }, after);
+      return;
+    }
+    let delay = 0;
+    if (req.url === MIXER_PATH) { delay = slowNextMixerReplyMs; slowNextMixerReplyMs = 0; }
+    if (req.url === ROUTER_PATH) {
+      delay = slowNextRouterReplyMs;
+      slowNextRouterReplyMs = 0;
+      maxRouterInFlight = Math.max(maxRouterInFlight, ++routerInFlight);
+    }
+    setTimeout(() => {
+      if (req.url === ROUTER_PATH) routerInFlight--;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    }, delay);
   });
 });
 
@@ -81,6 +108,7 @@ afterAll(() => {
 
 // Imported after STROM_URL is set so config picks up the throwaway server.
 const { handleMessage, clearAudioState } = await import('../ws/controller.js');
+const { confirmFastFeedState } = await import('../services/fast-feed-state.js');
 const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
 const { setTally } = await import('../services/tally.service.js');
 
@@ -114,16 +142,25 @@ function makeProduction(withRouter = true) {
 }
 
 const ws = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
-const ctx = { audioBlockId: MIXER_ID };
+// One controller connection per test: rate limiting is per connection.
+let ctx: { audioBlockId: string } = { audioBlockId: MIXER_ID };
 const send = (msg: Record<string, unknown>) => handleMessage(PROD, ws, JSON.stringify(msg), ctx);
 const routerMatrices = () =>
   patches.filter((p) => p.path === ROUTER_PATH).map((p) => (p.body['properties'] as Record<string, unknown>)['routing_matrix']);
 
 beforeEach(() => {
+  ctx = { audioBlockId: MIXER_ID };
   patches.length = 0;
   routerFails = false;
+  mixerFails = false;
+  slowNextMixerReplyMs = 0;
+  failNextMixerAfterMs = null;
+  slowNextRouterReplyMs = 0;
+  maxRouterInFlight = 0;
   mockBroadcast.mockReset();
   clearAudioState(PROD);
+  // As after a controller's first connect: the router may follow the mixer.
+  confirmFastFeedState(PROD);
   mockProductionGet.mockResolvedValue(makeProduction());
 });
 
@@ -166,6 +203,84 @@ describe('crew mutes reach the fast return feeds', () => {
     await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     expect(patches.find((p) => p.path === MIXER_PATH)!.body['properties']).toMatchObject({ ch1_to_main: false });
     expect(mockBroadcast).toHaveBeenCalledWith(PROD, { type: 'AUDIO_STATE', elementId: 'ch1', property: 'mute', value: true });
+  });
+
+  it('a cut and a quick cut back end the fast feeds where program ends, however Strom orders its replies', async () => {
+    setTally(PROD, { pgm: 'video_in_1', pvw: 'video_in_3' });
+    await send({ type: 'AFV_SET', mixerInput: 'video_in_1', enabled: true });
+    await send({ type: 'AFV_SET', mixerInput: 'video_in_3', enabled: true });
+    patches.length = 0;
+
+    slowNextMixerReplyMs = 200;
+    await send({ type: 'CUT', mixerInput: 'video_in_3' });
+    await send({ type: 'CUT', mixerInput: 'video_in_1' });
+    // applyAudioFollow is fired without awaiting; let both cuts' requests land.
+    await vi.waitFor(() => expect(routerMatrices()).toHaveLength(2), { timeout: 2000 });
+    const mixerWrites = patches.filter((p) => p.path === MIXER_PATH).map((p) => p.body['properties'] as Record<string, unknown>);
+    expect(mixerWrites.at(-1)).toMatchObject({ ch1_to_main: true, ch3_to_main: false });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+  });
+
+  it('a cut the mixer refused leaves the fast feeds where program still is', async () => {
+    setTally(PROD, { pgm: 'video_in_1', pvw: 'video_in_3' });
+    await send({ type: 'AFV_SET', mixerInput: 'video_in_1', enabled: true });
+    await send({ type: 'AFV_SET', mixerInput: 'video_in_3', enabled: true });
+    patches.length = 0;
+
+    mixerFails = true;
+    await send({ type: 'CUT', mixerInput: 'video_in_3' });
+    await vi.waitFor(() => expect(patches.some((p) => p.path === MIXER_PATH)).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(routerMatrices()).toEqual([]);
+
+    // The next change carries program's state, not the refused cut.
+    mixerFails = false;
+    await send({ type: 'AUDIO_SET', elementId: 'ch2', property: 'mute', value: false });
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]))]);
+  });
+
+  it('an AFV_SET the mixer refused leaves the fast feeds alone', async () => {
+    setTally(PROD, { pgm: 'video_in_1', pvw: 'video_in_3' });
+    mixerFails = true;
+    await send({ type: 'AFV_SET', mixerInput: 'video_in_3', enabled: true });
+    expect(routerMatrices()).toEqual([]);
+    mixerFails = false;
+    await send({ type: 'AUDIO_SET', elementId: 'ch2', property: 'mute', value: false });
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1])]);
+  });
+
+  it('a mute the mixer refused leaves the fast feeds alone', async () => {
+    mixerFails = true;
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    expect(routerMatrices()).toEqual([]);
+    mixerFails = false;
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]))]);
+  });
+
+  it('undoing a refused mute leaves a newer change to that channel in place', async () => {
+    failNextMixerAfterMs = 150;
+    const refused = send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await refused;
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+  });
+
+  it('sends router writes one at a time, the last one carrying every change', async () => {
+    slowNextRouterReplyMs = 150;
+    await Promise.all([
+      send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true }),
+      send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true }),
+    ]);
+    expect(maxRouterInFlight).toBe(1);
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+  });
+
+  it('sends nothing to the router until the state is known to match the mixer', async () => {
+    clearAudioState(PROD); // a restart, before any controller has connected
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    expect(patches.map((p) => p.path)).toEqual([MIXER_PATH]);
   });
 
   it('keeps a mute made before the production had a router', async () => {

@@ -23,6 +23,8 @@ import type { StromClient } from './strom.js';
 export const FAST_ROUTER_LATENCY_MS = 15;
 export const FAST_ROUTER_MIN_UPSTREAM_LATENCY_MS = 10;
 export const FAST_ROUTER_OUTPUT_BUFFER_MS = 5;
+/** Most inputs, and most outputs, a `builtin.liveaudiorouter` builds (Strom's `MAX_STREAMS`). */
+export const FAST_ROUTER_MAX_STREAMS = 8;
 
 type Block = Record<string, unknown>;
 type Link = { from: string; to: string };

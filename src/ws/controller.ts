@@ -26,7 +26,7 @@ import {
   type PersistedReturnBus,
   type ReturnMode,
 } from '../lib/return-feeds.js';
-import { recordFastFeedChanges, clearFastFeedState, syncFastFeedRouter } from '../services/fast-feed-state.js';
+import { recordFastFeedChanges, clearFastFeedState, confirmFastFeedState, syncFastFeedRouter } from '../services/fast-feed-state.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -1076,28 +1076,26 @@ async function applyAudioFollow(
     (doc.returnBuses ?? []) as PersistedReturnBus[],
     toMainChanges,
   ));
+  // Recorded before the mixer write so rapid cuts land in the order they were made.
+  const undoFast = recordToMainForFastFeeds(productionId, toMainChanges);
+  let mixerOk = true;
   if (Object.keys(properties).length > 0) {
     await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
-      .catch((err) => console.warn('[controller] audio follow error:', String(err)));
+      .catch((err) => { mixerOk = false; console.warn('[controller] audio follow error:', String(err)); });
   }
-  await mirrorToMainIntoFastFeeds(productionId, doc, toMainChanges, strom);
+  if (mixerOk) await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+  else undoFast();
 }
 
 /**
- * Mirrors `ch{N}_to_main` changes into the fast feeds' router (conversation flow),
- * so a guest the crew took off program is not heard there either. Runs after the
- * mixer update: a failure here leaves the mute in place on program and the
+ * Records `ch{N}_to_main` changes for the fast feeds' router (conversation flow),
+ * so a guest the crew took off program is not heard there either. Call before
+ * the mixer write; sync the router after it succeeds, or call the returned undo
+ * if it fails. A router failure leaves the change in place on program and the
  * picture feeds, and costs only the fast feeds' copy of it.
  */
-async function mirrorToMainIntoFastFeeds(
-  productionId: string,
-  doc: ProductionDoc,
-  toMainChanges: ReadonlyMap<number, boolean>,
-  strom: StromClient,
-): Promise<void> {
-  if (toMainChanges.size === 0) return;
-  recordFastFeedChanges(productionId, [...toMainChanges].map(([channel, toMain]) => ({ channel, toMain })));
-  await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+function recordToMainForFastFeeds(productionId: string, toMainChanges: ReadonlyMap<number, boolean>): () => void {
+  return recordFastFeedChanges(productionId, [...toMainChanges].map(([channel, toMain]) => ({ channel, toMain })));
 }
 
 // ---------------------------------------------------------------------------
@@ -1917,13 +1915,18 @@ export async function handleMessage(
             try {
               const s = await makeStromClient();
               const propName = capturedLogicalId === 'main' ? 'main_fader' : `ch${ch}_fader`;
-              await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
-                properties: { [propName]: capturedValue },
-              });
-              if (ch !== null && typeof capturedValue === 'number') {
-                recordFastFeedChanges(productionId, [{ channel: ch - 1, gain: capturedValue }]);
-                await syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
+              const undoFast = ch !== null && typeof capturedValue === 'number'
+                ? recordFastFeedChanges(productionId, [{ channel: ch - 1, gain: capturedValue }])
+                : undefined;
+              try {
+                await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+                  properties: { [propName]: capturedValue },
+                });
+              } catch (err) {
+                undoFast?.();
+                throw err;
               }
+              if (undoFast) await syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
               broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
@@ -1958,14 +1961,20 @@ export async function handleMessage(
               new Map([[ch - 1, !msg.value]]),
             ));
           }
-          await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
-            properties: props,
-            ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
-          });
           const chMute = /^ch(\d+)$/.exec(msg.elementId);
-          if (chMute) {
-            await mirrorToMainIntoFastFeeds(productionId, doc, new Map([[parseInt(chMute[1], 10) - 1, !msg.value]]), strom);
+          const undoFast = chMute
+            ? recordToMainForFastFeeds(productionId, new Map([[parseInt(chMute[1], 10) - 1, !msg.value]]))
+            : undefined;
+          try {
+            await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
+              properties: props,
+              ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
+            });
+          } catch (err) {
+            undoFast?.();
+            throw err;
           }
+          if (undoFast) await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
@@ -1997,6 +2006,8 @@ export async function handleMessage(
             mutedElementsByProduction.get(productionId)?.delete(elementId);
             broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'mute', value: false });
             const strom = await makeStromClient();
+            const undoFast = recordToMainForFastFeeds(productionId, new Map([[chIdx, isOnPgm]]));
+            let mixerOk = true;
             await strom.flows.updateBlockProperties(doc.stromFlowId, `${ctx.audioBlockId}`, {
               properties: {
                 [`ch${chIdx + 1}_to_main`]: isOnPgm,
@@ -2006,8 +2017,9 @@ export async function handleMessage(
                   new Map([[chIdx, isOnPgm]]),
                 ),
               },
-            }).catch((err) => console.warn('[controller] AFV_SET routing error:', err));
-            await mirrorToMainIntoFastFeeds(productionId, doc, new Map([[chIdx, isOnPgm]]), strom);
+            }).catch((err) => { mixerOk = false; console.warn('[controller] AFV_SET routing error:', err); });
+            if (mixerOk) await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+            else undoFast();
           }
         }
       } else {
@@ -2797,11 +2809,15 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
-              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .catch((err) => console.warn('[controller] init channel props error:', err));
-              // The router may still hold what the crew set before a server restart.
+              const initOk = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .then(() => true, (err) => { console.warn('[controller] init channel props error:', err); return false; });
+              // Every channel is now open at unity on the mixer; the router may still
+              // hold what the crew set before a server restart.
               clearFastFeedState(id);
-              await syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
+              if (initOk) {
+                confirmFastFeedState(id);
+                await syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
+              }
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated

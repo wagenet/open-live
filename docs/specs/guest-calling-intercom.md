@@ -409,7 +409,9 @@ implementation or in a dependent `open-live-studio` ticket.
   clean contributor). Open: the router feeds raw microphones, with no limiter unless
   Eyevinn/strom#795 lands. Because it is fed before the mixer, the router copies each channel's
   crew state into its crosspoints: mute and audio-follow-video (`to_main`), the REST channel
-  mute, and the fader level, capped at unity. Measure path headroom first; see
+  mute, and the fader level, capped at unity. The router takes at most 8 inputs and 8 outputs;
+  a production with more audio channels or fast feeds than that gets no fast feed, and its
+  guests use the picture feed's audio. Measure path headroom first; see
   [Low-latency mode](#low-latency-mode-after-v1). Applies to assignments with
   `returnFeed.lowLatency: true`.
 - **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This
