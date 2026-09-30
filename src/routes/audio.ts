@@ -173,9 +173,8 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
             5000,
           );
         } catch (err) {
-          // A timed-out write may still have been applied; keep the fast feeds with it.
-          if (err instanceof StromTimeoutError) fast?.settle();
-          if (fast && (err instanceof StromTimeoutError || fast.undo())) {
+          // A timed-out write may still have been applied; undo keeps the fast feeds with it.
+          if (fast?.undo(err)) {
             void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
           }
           throw err;

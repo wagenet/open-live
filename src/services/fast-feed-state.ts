@@ -17,10 +17,14 @@
  * the first controller connect (which resets every channel) or after activation
  * (a new router and a new mixer both start with every channel open). Until then,
  * changes are recorded but not sent.
+ *
+ * Whatever the order of answers, a check puts the router right: after a refused
+ * or unanswered mixer write, or a failed router write, it reads the mixer a
+ * moment later and writes what the mixer holds to the router.
  */
 
 import { fastRoutingMatrix, type FastFeedRouter } from '../lib/fast-returns.js';
-import type { StromClient } from '../lib/strom.js';
+import { StromClientError, type StromClient } from '../lib/strom.js';
 
 /** One change to a 0-based channel. */
 export type FastFeedChange =
@@ -49,8 +53,21 @@ interface ChannelState {
 /** A recorded change, to settle once the mixer accepts it or undo if it refuses. */
 export interface FastFeedRecord {
   settle(): void;
-  /** Returns whether a router write already carried the change, so the router needs writing again. */
-  undo(): boolean;
+  /**
+   * Undoes the change after a failed mixer write, or keeps it when `err` leaves
+   * open whether the mixer applied it (see `mixerRefused`). Either way a check
+   * follows. Returns whether the router needs writing again.
+   */
+  undo(err?: unknown): boolean;
+}
+
+/**
+ * Whether a failed mixer write was refused by Strom itself (4xx, or a 500 it
+ * answered). A lost reply (no connection, a gateway 502-504, a timeout) may
+ * follow a write Strom applied.
+ */
+export function mixerRefused(err: unknown): boolean {
+  return err instanceof StromClientError && err.status >= 400 && err.status <= 500;
 }
 
 const stateByProduction = new Map<string, ChannelState>();
@@ -65,6 +82,8 @@ const waitingWrite = new Map<string, { flowId: string; blockId: string; write: P
  */
 interface WriteRun { sent: number; landed: number }
 const writeRuns = new Map<string, WriteRun>();
+/** Per production: the router and matrix of the last write sent, while it is not known to have failed. */
+const lastSent = new Map<string, { router: FastFeedRouter; matrix: string }>();
 
 function writeRunFor(productionId: string): WriteRun {
   let run = writeRuns.get(productionId);
@@ -139,44 +158,128 @@ export function recordFastFeedChanges(productionId: string, changes: Iterable<Fa
   }
   const routerWritesBefore = s.routerWrites;
   let answered = false;
-  const answer = (accepted: boolean): boolean => {
-    if (answered) return false;
+  const answer = (accepted: boolean): void => {
     answered = true;
-    let changed = false;
     for (const r of recorded) {
       const entry = s.changes.get(r.key)!;
       entry.unanswered = entry.unanswered.filter((c) => c !== r.change);
       if (accepted) {
         if (r.change.version > entry.settled.version) entry.settled = r.change;
-        continue;
-      }
-      const value = newest(entry).value;
-      if (value !== read(s, r.kind, r.channel)) {
-        write(s, r.kind, r.channel, value);
-        changed = true;
+      } else {
+        write(s, r.kind, r.channel, newest(entry).value);
       }
     }
-    return changed && s.routerWrites > routerWritesBefore;
   };
-  return { settle: () => { answer(true); }, undo: () => answer(false) };
+  return {
+    settle: () => { if (!answered) answer(true); },
+    undo: (err) => {
+      if (answered || stateByProduction.get(productionId) !== s) return false;
+      requestFastFeedCheck(productionId);
+      if (err !== undefined && !mixerRefused(err)) {
+        answer(true);
+        return true;
+      }
+      answer(false);
+      // A router write sent since the change was recorded may have carried it.
+      return s.routerWrites > routerWritesBefore && routerIsBehind(productionId);
+    },
+  };
+}
+
+/** Whether the router may not hold the production's current state. */
+function routerIsBehind(productionId: string): boolean {
+  const last = lastSent.get(productionId);
+  return !last || fastFeedMatrix(productionId, last.router) !== last.matrix;
+}
+
+/** Marks the start of a mixer read, for `fillFastFeedFromMixer`. */
+export function fastFeedReadMark(productionId: string): number {
+  return stateByProduction.get(productionId)?.nextVersion ?? 1;
 }
 
 /**
- * Takes the production's channel state from a read of the mixer. A change still
- * waiting on the mixer's answer stays newer than the read, since the read may
- * have reached Strom before it.
+ * Takes the production's channel state from a read of the mixer that started at
+ * `mark`. A change recorded since then, or still waiting on the mixer's answer,
+ * stays newer than the read, since the read may have reached Strom before it.
  */
-export function fillFastFeedFromMixer(productionId: string, changes: Iterable<FastFeedChange>): void {
+export function fillFastFeedFromMixer(productionId: string, changes: Iterable<FastFeedChange>, mark: number): void {
   const s = stateFor(productionId);
   for (const c of changes) {
     const kind = kindOf(c);
     const key = `${kind}:${c.channel}`;
     const value = 'toMain' in c ? c.toMain : 'muted' in c ? c.muted : c.gain;
-    const entry = s.changes.get(key);
-    if (entry) entry.settled = { version: 0, value };
-    else s.changes.set(key, { settled: { version: 0, value }, unanswered: [] });
-    write(s, kind, c.channel, entry ? newest(entry).value : value);
+    let entry = s.changes.get(key);
+    if (!entry) {
+      entry = { settled: { version: 0, value }, unanswered: [] };
+      s.changes.set(key, entry);
+    } else if (entry.settled.version < mark) {
+      entry.settled = { version: 0, value };
+    }
+    write(s, kind, c.channel, newest(entry).value);
   }
+}
+
+/** What a check reads: the mixer's channel state, or null when the read is incomplete, and where to write it. */
+export interface FastFeedCheckRead {
+  changes: FastFeedChange[] | null;
+  router: FastFeedRouter | undefined;
+  strom: Pick<StromClient, 'flows'>;
+}
+
+type FastFeedChecker = (productionId: string) => Promise<FastFeedCheckRead | null>;
+let checker: FastFeedChecker | undefined;
+const checkTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** Checks in a row that could not put the router right, per production. */
+const checkFailures = new Map<string, number>();
+/** Bumped when a production's state is cleared, so a check from before the clear stops. */
+const generations = new Map<string, number>();
+
+/** How long after a failure the check reads the mixer, and how many checks in a row may fail. */
+const CHECK_DELAY_MS = 2000;
+const CHECK_ATTEMPTS = 5;
+
+/** Sets how a check reads a production's mixer and finds its router. */
+export function setFastFeedChecker(fn: FastFeedChecker | undefined): void {
+  checker = fn;
+}
+
+/** Reads the mixer shortly and writes what it holds to the router, unless a check is already due. */
+export function requestFastFeedCheck(productionId: string): void {
+  if (!checker || checkTimers.has(productionId)) return;
+  const timer = setTimeout(() => {
+    checkTimers.delete(productionId);
+    void runCheck(productionId);
+  }, CHECK_DELAY_MS);
+  timer.unref?.();
+  checkTimers.set(productionId, timer);
+}
+
+function checkFailed(productionId: string): void {
+  const failures = (checkFailures.get(productionId) ?? 0) + 1;
+  checkFailures.set(productionId, failures);
+  if (failures < CHECK_ATTEMPTS) requestFastFeedCheck(productionId);
+  else console.warn(`[fast-feed] gave up putting the router right after ${failures} checks`);
+}
+
+async function runCheck(productionId: string): Promise<void> {
+  const generation = generations.get(productionId);
+  const mark = fastFeedReadMark(productionId);
+  const found = await checker!(productionId).catch((err) => {
+    console.warn('[fast-feed] mixer read error:', String(err));
+    return null;
+  });
+  if (generations.get(productionId) !== generation) return;
+  if (!found?.changes || !found.router) {
+    checkFailed(productionId);
+    return;
+  }
+  fillFastFeedFromMixer(productionId, found.changes, mark);
+  confirmFastFeedState(productionId);
+  if (!routerIsBehind(productionId) && lastSent.get(productionId)?.router.flowId === found.router.flowId) {
+    checkFailures.delete(productionId);
+    return;
+  }
+  await syncFastFeedRouter(productionId, found.router, found.strom);
 }
 
 /**
@@ -190,6 +293,11 @@ export function clearFastFeedState(productionId: string): void {
   pendingWrite.delete(productionId);
   waitingWrite.delete(productionId);
   writeRuns.delete(productionId);
+  lastSent.delete(productionId);
+  clearTimeout(checkTimers.get(productionId));
+  checkTimers.delete(productionId);
+  checkFailures.delete(productionId);
+  generations.set(productionId, (generations.get(productionId) ?? 0) + 1);
 }
 
 /** Marks the production's channel state as matching its mixer, so it may be written to the router. */
@@ -212,8 +320,8 @@ const ROUTER_WRITE_TIMEOUT_MS = 5000;
  * write already on its way. Callers do not wait for it: the crew's own feedback
  * never waits on the fast feeds. A write still waiting its turn picks up later
  * changes, so a slow router gets one write, not a backlog. A failure or timeout
- * is logged and costs only the fast feeds' copy of the change. A timed-out write
- * that lands after a later write is followed by a fresh one.
+ * is logged and followed by a check. A timed-out write that lands after a later
+ * write is followed by a fresh one.
  *
  * @param onlyIfChanged skip the write when nothing has been recorded (the router
  *   was built with every channel open at unity)
@@ -238,23 +346,31 @@ export function syncFastFeedRouter(
     const s = stateByProduction.get(productionId);
     if (s) s.routerWrites++;
     const sent = ++run.sent;
+    lastSent.set(productionId, { router, matrix: routing_matrix });
     const request = strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } });
     // Strom may answer writes out of order. One answered after a later write
     // has put an older matrix back, so the current state goes out again.
     void request.then(() => {
       const overtaken = run.landed > sent;
       run.landed = Math.max(run.landed, sent);
-      if (overtaken && writeRuns.get(productionId) === run) void syncFastFeedRouter(productionId, router, strom);
+      if (writeRuns.get(productionId) !== run) return;
+      if (sent === run.sent) checkFailures.delete(productionId);
+      if (overtaken) void syncFastFeedRouter(productionId, router, strom);
     }, () => undefined);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     const timeout = new Promise<void>((resolve) => {
       timer = setTimeout(() => { timedOut = true; resolve(); }, ROUTER_WRITE_TIMEOUT_MS);
     });
-    await Promise.race([request, timeout])
-      .catch((err) => console.warn('[fast-feed] router update error:', String(err)))
-      .finally(() => clearTimeout(timer));
+    const failed = await Promise.race([request, timeout]).then(
+      () => timedOut,
+      (err) => { console.warn('[fast-feed] router update error:', String(err)); return true; },
+    ).finally(() => clearTimeout(timer));
     if (timedOut) console.warn(`[fast-feed] router update timed out after ${ROUTER_WRITE_TIMEOUT_MS} ms`);
+    if (failed && writeRuns.get(productionId) === run) {
+      if (lastSent.get(productionId)?.matrix === routing_matrix) lastSent.delete(productionId);
+      checkFailed(productionId);
+    }
   }).finally(() => {
     if (pendingWrite.get(productionId) === next) pendingWrite.delete(productionId);
   });

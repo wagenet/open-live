@@ -7,6 +7,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   recordFastFeedChanges,
   fillFastFeedFromMixer,
+  fastFeedReadMark,
+  setFastFeedChecker,
   confirmFastFeedState,
   clearFastFeedState,
   syncFastFeedRouter,
@@ -159,14 +161,37 @@ describe('a channel\'s value as the mixer answers its changes', () => {
 
   it('keeps a change still waiting on the mixer over a read of the mixer, until the mixer answers', () => {
     const mute = recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]);
-    fillFastFeedFromMixer(PROD, [{ channel: 0, toMain: true }]);
+    fillFastFeedFromMixer(PROD, [{ channel: 0, toMain: true }], fastFeedReadMark(PROD));
     expect(closed()).toBe(true);
     mute.undo();
     expect(closed()).toBe(false);
 
     const mute2 = recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]);
-    fillFastFeedFromMixer(PROD, [{ channel: 0, toMain: true }]);
+    fillFastFeedFromMixer(PROD, [{ channel: 0, toMain: true }], fastFeedReadMark(PROD));
     mute2.settle();
     expect(closed()).toBe(true);
+  });
+});
+
+describe('checks after a failed router write', () => {
+  afterEach(() => setFastFeedChecker(undefined));
+
+  it('stops after five checks in a row fail to write the router', async () => {
+    const writes: string[] = [];
+    const strom = {
+      flows: {
+        updateBlockProperties: vi.fn(async (_flowId: string, _blockId: string, body: { properties: { routing_matrix: string } }) => {
+          writes.push(body.properties.routing_matrix);
+          throw new Error('pipeline not running');
+        }),
+      },
+    } as unknown as Parameters<typeof syncFastFeedRouter>[2];
+    setFastFeedChecker(async () => ({ changes: [{ channel: 0, toMain: false }], router: ROUTER, strom }));
+    recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]).settle();
+    void syncFastFeedRouter(PROD, ROUTER, strom);
+    await vi.advanceTimersByTimeAsync(600_000);
+    // The crew's write, then one per check.
+    expect(writes).toHaveLength(5);
+    expect(writes.every((m) => m === fastRoutingMatrix(3, [1], new Set([0])))).toBe(true);
   });
 });

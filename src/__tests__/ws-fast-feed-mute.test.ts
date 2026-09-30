@@ -61,6 +61,8 @@ let slowMixerWrite: { match: (props: Record<string, unknown>) => boolean; ms: nu
 let failNextMixerAfterMs: number | null = null;
 /** Refuse every mixer write whose properties match, this late (ms). */
 let refuseMixerWrites: { match: (props: Record<string, unknown>) => boolean; ms: number } | null = null;
+/** Apply a matching mixer write and lose the reply: drop the connection, or answer as a gateway would. */
+let loseMixerReply: { match: (props: Record<string, unknown>) => boolean; as: 'reset' | '504' } | null = null;
 let slowNextRouterReplyMs = 0;
 let routerInFlight = 0;
 let maxRouterInFlight = 0;
@@ -75,6 +77,15 @@ const stromServer: Server = createServer((req, res) => {
     if ((routerFails && req.url === ROUTER_PATH) || (mixerFails && req.url === MIXER_PATH)) {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'block gone' }));
+      return;
+    }
+    if (req.url === MIXER_PATH && loseMixerReply?.match(body['properties'] as Record<string, unknown>)) {
+      if (loseMixerReply.as === 'reset') {
+        req.socket.destroy();
+      } else {
+        res.writeHead(504, { 'content-type': 'text/html' });
+        res.end('<html>504 Gateway Time-out</html>');
+      }
       return;
     }
     if (req.url === MIXER_PATH && failNextMixerAfterMs !== null) {
@@ -176,6 +187,7 @@ beforeEach(() => {
   slowMixerWrite = null;
   failNextMixerAfterMs = null;
   refuseMixerWrites = null;
+  loseMixerReply = null;
   slowNextRouterReplyMs = 0;
   maxRouterInFlight = 0;
   mockBroadcast.mockReset();
@@ -316,6 +328,27 @@ describe('crew mutes reach the fast return feeds', () => {
     await refused;
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
   });
+
+  it('opens the router again when a mute and an unmute are both refused after another channel\'s write carried the mute', async () => {
+    refuseMixerWrites = { match: (props) => props['ch1_to_main'] !== undefined, ms: 300 };
+    const mute = send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await vi.waitFor(() => expect(patches.some((p) => p.path === MIXER_PATH)).toBe(true));
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+    const unmute = send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    await Promise.all([mute, unmute]);
+    await whenFastFeedRouterIdle(PROD);
+    // Program has ch1 open (both refused) and ch3 closed.
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+  });
+
+  for (const lost of ['reset', '504'] as const) {
+    it(`keeps a mute in the fast feeds when the mixer's reply is lost (${lost})`, async () => {
+      loseMixerReply = { match: (props) => props['ch1_to_main'] === false, as: lost };
+      await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+      expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
+    });
+  }
 
   it('sends router writes one at a time, the last one carrying every change', async () => {
     slowNextRouterReplyMs = 150;
