@@ -143,24 +143,30 @@ export function planFastReturns(
 
 /**
  * The router's `routing_matrix`: output N sums every channel except
- * `ownChannels[N]` and the channels the crew has taken off program.
- * Crosspoint keys are `i<input>c<channel>` → [`o<output>c<channel>`], stereo.
+ * `ownChannels[N]` and the channels the crew has closed, each at its fader
+ * level. Crosspoint keys are `i<input>c<channel>` → `o<output>c<channel>`, stereo:
+ * a list opens them at unity, an object gives a gain (Strom caps it at unity).
  *
  * @param numInputs   audio channels on the router
  * @param ownChannels 0-based own channel per router output
- * @param offProgram  0-based channels whose `to_main` is currently off
+ * @param closed      0-based channels the crew has taken off program or muted
+ * @param gains       0-based channel → linear fader level; absent is unity
  */
 export function fastRoutingMatrix(
   numInputs: number,
   ownChannels: readonly number[],
-  offProgram: ReadonlySet<number> = new Set(),
+  closed: ReadonlySet<number> = new Set(),
+  gains: ReadonlyMap<number, number> = new Map(),
 ): string {
-  const matrix: Record<string, string[]> = {};
+  const matrix: Record<string, string[] | Record<string, number>> = {};
   ownChannels.forEach((own, out) => {
     for (let ch = 0; ch < numInputs; ch++) {
-      if (ch === own || offProgram.has(ch)) continue;
+      const gain = Math.min(1, Math.max(0, gains.get(ch) ?? 1));
+      if (ch === own || closed.has(ch) || gain === 0) continue;
       for (const c of [0, 1]) {
-        (matrix[`i${ch}c${c}`] ??= []).push(`o${out}c${c}`);
+        const key = `i${ch}c${c}`;
+        if (gain === 1) ((matrix[key] ??= []) as string[]).push(`o${out}c${c}`);
+        else ((matrix[key] ??= {}) as Record<string, number>)[`o${out}c${c}`] = gain;
       }
     }
   });

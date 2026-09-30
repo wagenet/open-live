@@ -1,0 +1,190 @@
+/**
+ * The fast return feeds' router after the server loses its in-memory audio state
+ * (a restart) and the first controller connects, and after a change made through
+ * the REST audio route.
+ *
+ * Drives the real controller plugin over a live socket (the connect-time reset
+ * lives there) and the real REST route via inject, against a throwaway Strom that
+ * records writes. CouchDB is mocked.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { WebSocket } from 'ws';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { FastifyInstance } from 'fastify';
+
+const SOURCES: Record<string, Record<string, unknown>> = {
+  'cam-a': { _id: 'cam-a', name: 'Camera A', streamType: 'srt', address: 'srt://10.0.0.1:9000?mode=caller' },
+  'cam-b': { _id: 'cam-b', name: 'Camera B', streamType: 'srt', address: 'srt://10.0.0.2:9000?mode=caller' },
+  'cam-c': { _id: 'cam-c', name: 'Camera C', streamType: 'srt', address: 'srt://10.0.0.3:9000?mode=caller' },
+};
+const productionDocs = new Map<string, Record<string, unknown>>();
+
+vi.mock('../db/index.js', () => ({
+  getDb: () => ({
+    get: vi.fn(async (id: string) => {
+      const doc = productionDocs.get(id);
+      if (!doc) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+      return structuredClone(doc);
+    }),
+    insert: vi.fn().mockResolvedValue({ ok: true }),
+    find: vi.fn().mockResolvedValue({ docs: [] }),
+  }),
+  getSourcesDb: () => ({
+    get: vi.fn(async (id: string) => {
+      if (!SOURCES[id]) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+      return { ...SOURCES[id] };
+    }),
+    insert: vi.fn(),
+    find: vi.fn().mockResolvedValue({ docs: [] }),
+  }),
+  getGraphicsDb: () => ({ get: vi.fn().mockRejectedValue(new Error('not found')) }),
+  getOutputsDb: () => ({ get: vi.fn(), find: vi.fn().mockResolvedValue({ docs: [] }) }),
+  connectDb: vi.fn().mockResolvedValue(undefined),
+  isDbReady: vi.fn().mockResolvedValue(true),
+  isDbConnected: vi.fn().mockReturnValue(true),
+}));
+vi.mock('../lib/flow-generator.js', () => ({ activateStromFlow: vi.fn(), deactivateStromFlow: vi.fn() }));
+vi.mock('../lib/strom-token.js', () => ({ getStromToken: vi.fn().mockResolvedValue(undefined) }));
+
+const FLOW_ID = 'flow-program';
+const MIXER_ID = 'b-mixer';
+const CONV_FLOW_ID = 'flow-conv';
+const ROUTER_ID = 'b-fast-router';
+const ROUTER_PATH = `/api/flows/${CONV_FLOW_ID}/blocks/${ROUTER_ID}/properties`;
+const MIXER_PATH = `/api/flows/${FLOW_ID}/blocks/${MIXER_ID}/properties`;
+
+const patches: Array<{ path: string; body: Record<string, unknown> }> = [];
+const stromServer: Server = createServer((req, res) => {
+  const chunks: Buffer[] = [];
+  req.on('data', (c: Buffer) => chunks.push(c));
+  req.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    if (req.method === 'PATCH' || (req.method === 'POST' && req.url?.includes('/elements/'))) {
+      patches.push({ path: req.url ?? '', body });
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.method === 'GET' && req.url === `/api/flows/${FLOW_ID}`) {
+      res.end(JSON.stringify({ flow: { id: FLOW_ID, name: 'p', elements: [], links: [], blocks: [
+        { id: MIXER_ID, block_definition_id: 'builtin.mixer', name: 'Mixer', properties: { num_channels: 3 }, position: { x: 0, y: 0 } },
+      ] } }));
+      return;
+    }
+    if (req.method === 'GET' && req.url === MIXER_PATH) {
+      res.end(JSON.stringify({ properties: {} }));
+      return;
+    }
+    res.end(JSON.stringify({ success: true }));
+  });
+});
+await new Promise<void>((resolve) => stromServer.listen(0, '127.0.0.1', () => resolve()));
+process.env['STROM_URL'] = `http://127.0.0.1:${(stromServer.address() as AddressInfo).port}`;
+afterAll(() => stromServer.close());
+
+const { buildServer } = await import('../server.js');
+const { handleMessage, clearAudioState } = await import('../ws/controller.js');
+const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
+
+const PROD = 'prod-fast-connect';
+function makeProduction() {
+  return {
+    _id: PROD, _rev: '1-abc', type: 'production', name: 'Fast connect', status: 'active',
+    stromFlowId: FLOW_ID, audioMixerBlockId: MIXER_ID,
+    sources: [
+      { sourceId: 'cam-a', mixerInput: 'video_in_1' },
+      { sourceId: 'cam-b', mixerInput: 'video_in_2', returnFeed: { synced: 'program-minus', lowLatency: true } },
+      { sourceId: 'cam-c', mixerInput: 'video_in_3' },
+    ],
+    returnBuses: [{ mixerInput: 'video_in_2', auxBus: 1, ownChannel: 1, mode: 'program-minus' }],
+    fastFeedRouter: { flowId: CONV_FLOW_ID, blockId: ROUTER_ID, numInputs: 3, ownChannels: [1] },
+    graphicAssignments: [], values: {}, pipeline: { stromConfig: null, status: 'running' },
+    graphics: [], macros: [], tally: { pgm: null, pvw: null },
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+let app: FastifyInstance;
+const fakeWs = { send: vi.fn() } as unknown as import('@fastify/websocket').WebSocket;
+const send = (msg: Record<string, unknown>) => handleMessage(PROD, fakeWs, JSON.stringify(msg), { audioBlockId: MIXER_ID });
+const routerMatrices = () =>
+  patches.filter((p) => p.path === ROUTER_PATH).map((p) => (p.body['properties'] as Record<string, unknown>)['routing_matrix']);
+
+async function connectOnce(): Promise<void> {
+  const { port } = app.server.address() as AddressInfo;
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/productions/${PROD}/controller`);
+  await new Promise<void>((resolve, reject) => {
+    ws.on('error', reject);
+    ws.on('message', (d) => {
+      try { if ((JSON.parse(d.toString()) as { type?: string }).type === 'SNAPSHOT_END') resolve(); } catch { /* ignore */ }
+    });
+    ws.on('open', () => setTimeout(resolve, 800));
+  });
+  ws.close();
+}
+
+beforeEach(async () => {
+  patches.length = 0;
+  productionDocs.clear();
+  productionDocs.set(PROD, makeProduction());
+  clearAudioState(PROD);
+  app = await buildServer();
+  await app.listen({ port: 0, host: '127.0.0.1' });
+});
+afterEach(async () => { await app.close(); });
+
+describe('fast feeds after a server restart', () => {
+  it('reopens a channel muted before the restart once the first connect puts it back on program', async () => {
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
+
+    // A restart loses every in-memory registry; the router keeps its matrix.
+    clearAudioState(PROD);
+    patches.length = 0;
+
+    await connectOnce();
+    const init = patches.find((p) => p.path === MIXER_PATH && (p.body['properties'] as Record<string, unknown>)['ch1_to_main'] !== undefined);
+    expect((init!.body['properties'] as Record<string, unknown>)['ch1_to_main']).toBe(true);
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1])]);
+  });
+
+  it('reopens a channel muted through the REST route before anyone connected', async () => {
+    await app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/ch1`, payload: { property: 'mute', value: true } });
+    patches.length = 0;
+    // The first connect sets every ch<N>_mute back to false on the mixer.
+    await connectOnce();
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1])]);
+  });
+
+  it('leaves the router alone on a later connect', async () => {
+    await connectOnce();
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    patches.length = 0;
+    await connectOnce();
+    expect(routerMatrices()).toEqual([]);
+  });
+});
+
+describe('fast feeds and the REST audio route', () => {
+  const patchAudio = (elementId: string, payload: Record<string, unknown>) =>
+    app.inject({ method: 'PATCH', url: `/api/v1/productions/${PROD}/audio/${elementId}`, payload });
+
+  it('a mute takes the channel out of the fast feeds, and unmuting brings it back', async () => {
+    expect((await patchAudio('ch1', { property: 'mute', value: true })).statusCode).toBe(200);
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([0]))]);
+    expect((await patchAudio('ch1', { property: 'mute', value: false })).statusCode).toBe(200);
+    expect(routerMatrices()[1]).toBe(fastRoutingMatrix(3, [1]));
+  });
+
+  it('a volume becomes the channel\'s level in the fast feeds', async () => {
+    expect((await patchAudio('ch3', { property: 'volume', value: 0.25 })).statusCode).toBe(200);
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set(), new Map([[2, 0.25]]))]);
+  });
+
+  it('a REST mute and a crew mute of the same channel both have to lift before it returns', async () => {
+    await patchAudio('ch1', { property: 'mute', value: true });
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
+  });
+});

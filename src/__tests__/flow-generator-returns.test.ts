@@ -335,4 +335,13 @@ describe('fastRoutingMatrix', () => {
       i1c0: ['o1c0'], i1c1: ['o1c1'],
     });
   });
+
+  it('gives a channel below unity its fader level, closes it at zero and caps it at unity', async () => {
+    const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
+    // Guest on channel 0; channel 1 at half, channel 2 at zero, channel 3 above unity.
+    expect(JSON.parse(fastRoutingMatrix(4, [0], new Set(), new Map([[1, 0.5], [2, 0], [3, 1.8]])))).toEqual({
+      i1c0: { o0c0: 0.5 }, i1c1: { o0c1: 0.5 },
+      i3c0: ['o0c0'], i3c1: ['o0c1'],
+    });
+  });
 });

@@ -9,6 +9,7 @@ import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
+import { syncFastFeedRouter } from '../services/fast-feed-state.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
@@ -478,6 +479,9 @@ async function runActivationFlow(
           ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
         });
 
+        // Mutes and fader moves made while the flow was starting reached the mixer
+        // but not the router, which was built with every channel open.
+        await syncFastFeedRouter(productionId, activation.fastFeedRouter, strom, { onlyIfChanged: true });
         notifyProductionActivated(productionId);
         // Emit the PRODUCTION_STATUS lifecycle event for the active transition
         // (spec §3). Flow is playing, so all assigned outputs derive as healthy.

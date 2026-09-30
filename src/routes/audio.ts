@@ -5,6 +5,7 @@ import { loadAudioChannels } from '../lib/audio-channels.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
+import { recordFastFeedChanges, syncFastFeedRouter } from '../services/fast-feed-state.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
@@ -161,6 +162,13 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
           5000,
         );
+        if (ch !== null) {
+          const channel = ch - 1;
+          recordFastFeedChanges(req.params.id, [
+            property === 'mute' ? { channel, muted: body.value === true } : { channel, gain: Number(body.value) },
+          ]);
+          await syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+        }
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };

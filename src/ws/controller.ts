@@ -26,7 +26,7 @@ import {
   type PersistedReturnBus,
   type ReturnMode,
 } from '../lib/return-feeds.js';
-import { fastRoutingMatrix } from '../lib/fast-returns.js';
+import { recordFastFeedChanges, clearFastFeedState, syncFastFeedRouter } from '../services/fast-feed-state.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -605,9 +605,6 @@ const afvChannelsByProduction = new Map<string, Set<string>>()
  */
 const mutedElementsByProduction = new Map<string, Set<string>>()
 
-/** Maps productionId → 0-based channels whose `to_main` is off (mutes and AFV), for the fast feeds' router. */
-const fastOffProgramByProduction = new Map<string, Set<number>>()
-
 /**
  * Last-seen stromFlowId per production.
  * A changed flowId means the pipeline was rebuilt (sources remapped, etc.) so
@@ -786,7 +783,7 @@ export function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
   afvRampByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
-  fastOffProgramByProduction.delete(productionId)
+  clearFastFeedState(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
   sourceAudioOffsetsByProduction.delete(productionId)
@@ -1098,17 +1095,9 @@ async function mirrorToMainIntoFastFeeds(
   toMainChanges: ReadonlyMap<number, boolean>,
   strom: StromClient,
 ): Promise<void> {
-  const router = doc.fastFeedRouter;
-  if (!router || toMainChanges.size === 0) return;
-  let off = fastOffProgramByProduction.get(productionId);
-  if (!off) fastOffProgramByProduction.set(productionId, (off = new Set()));
-  for (const [ch, toMain] of toMainChanges) {
-    if (toMain) off.delete(ch);
-    else off.add(ch);
-  }
-  const routing_matrix = fastRoutingMatrix(router.numInputs, router.ownChannels, off);
-  await strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } })
-    .catch((err) => console.warn('[controller] fast feed mute mirror error:', String(err)));
+  if (toMainChanges.size === 0) return;
+  recordFastFeedChanges(productionId, [...toMainChanges].map(([channel, toMain]) => ({ channel, toMain })));
+  await syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
 }
 
 // ---------------------------------------------------------------------------
@@ -1931,6 +1920,10 @@ export async function handleMessage(
               await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
                 properties: { [propName]: capturedValue },
               });
+              if (ch !== null && typeof capturedValue === 'number') {
+                recordFastFeedChanges(productionId, [{ channel: ch - 1, gain: capturedValue }]);
+                await syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
+              }
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
               broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
@@ -2806,6 +2799,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               channelLevelsByProduction.set(id, levelCache);
               await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
                 .catch((err) => console.warn('[controller] init channel props error:', err));
+              // The router may still hold what the crew set before a server restart.
+              clearFastFeedState(id);
+              await syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated

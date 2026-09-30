@@ -407,7 +407,9 @@ implementation or in a dependent `open-live-studio` ticket.
   dropout and shifted its own delay by 220 ms (Strom loopback rig, 0–200 ms jitter, 0.4–1.2 s
   stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
   clean contributor). Open: the router feeds raw microphones, with no limiter unless
-  Eyevinn/strom#795 lands. Measure path headroom first; see
+  Eyevinn/strom#795 lands. Because it is fed before the mixer, the router copies each channel's
+  crew state into its crosspoints: mute and audio-follow-video (`to_main`), the REST channel
+  mute, and the fader level, capped at unity. Measure path headroom first; see
   [Low-latency mode](#low-latency-mode-after-v1). Applies to assignments with
   `returnFeed.lowLatency: true`.
 - **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This

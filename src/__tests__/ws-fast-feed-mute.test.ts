@@ -168,9 +168,44 @@ describe('crew mutes reach the fast return feeds', () => {
     expect(mockBroadcast).toHaveBeenCalledWith(PROD, { type: 'AUDIO_STATE', elementId: 'ch1', property: 'mute', value: true });
   });
 
+  it('keeps a mute made before the production had a router', async () => {
+    mockProductionGet.mockResolvedValue(makeProduction(false));
+    await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    mockProductionGet.mockResolvedValue(makeProduction());
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([0, 2]))]);
+  });
+
   it('sends nothing to a conversation flow when the production has no fast feed', async () => {
     mockProductionGet.mockResolvedValue(makeProduction(false));
     await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    expect(patches.map((p) => p.path)).toEqual([MIXER_PATH]);
+  });
+});
+
+describe('crew faders reach the fast return feeds', () => {
+  it('a fader level becomes the channel\'s level in the fast feeds, and zero takes it out', async () => {
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'volume', value: 0.5 });
+    // The fader is debounced; let its requests land.
+    await vi.waitFor(() => expect(routerMatrices()).toHaveLength(1));
+    expect(patches.map((p) => p.path)).toEqual([MIXER_PATH, ROUTER_PATH]);
+    expect(routerMatrices()[0]).toBe(fastRoutingMatrix(3, [1], new Set(), new Map([[2, 0.5]])));
+    expect(JSON.parse(routerMatrices()[0] as string)).toEqual({ i0c0: ['o0c0'], i0c1: ['o0c1'], i2c0: { o0c0: 0.5 }, i2c1: { o0c1: 0.5 } });
+
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'volume', value: 0 });
+    await vi.waitFor(() => expect(routerMatrices()).toHaveLength(2));
+    expect(routerMatrices()[1]).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+  });
+
+  it('plays a fader above unity at unity, the most a router crosspoint takes', async () => {
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'volume', value: 1.6 });
+    await vi.waitFor(() => expect(routerMatrices()).toHaveLength(1));
+    expect(routerMatrices()[0]).toBe(fastRoutingMatrix(3, [1]));
+  });
+
+  it('leaves the fast feeds alone when the main fader moves', async () => {
+    await send({ type: 'AUDIO_SET', elementId: 'main', property: 'volume', value: 0.3 });
+    await vi.waitFor(() => expect(patches).toHaveLength(1));
     expect(patches.map((p) => p.path)).toEqual([MIXER_PATH]);
   });
 });
