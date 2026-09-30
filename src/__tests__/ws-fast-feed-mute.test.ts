@@ -59,6 +59,8 @@ let slowNextMixerReplyMs = 0;
 let slowMixerWrite: { match: (props: Record<string, unknown>) => boolean; ms: number } | null = null;
 /** Refuse the next mixer write, this late (ms). */
 let failNextMixerAfterMs: number | null = null;
+/** Refuse every mixer write whose properties match, this late (ms). */
+let refuseMixerWrites: { match: (props: Record<string, unknown>) => boolean; ms: number } | null = null;
 let slowNextRouterReplyMs = 0;
 let routerInFlight = 0;
 let maxRouterInFlight = 0;
@@ -82,6 +84,13 @@ const stromServer: Server = createServer((req, res) => {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'block gone' }));
       }, after);
+      return;
+    }
+    if (req.url === MIXER_PATH && refuseMixerWrites?.match(body['properties'] as Record<string, unknown>)) {
+      setTimeout(() => {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'block gone' }));
+      }, refuseMixerWrites.ms);
       return;
     }
     let delay = 0;
@@ -166,6 +175,7 @@ beforeEach(() => {
   slowNextMixerReplyMs = 0;
   slowMixerWrite = null;
   failNextMixerAfterMs = null;
+  refuseMixerWrites = null;
   slowNextRouterReplyMs = 0;
   maxRouterInFlight = 0;
   mockBroadcast.mockReset();
@@ -285,6 +295,26 @@ describe('crew mutes reach the fast return feeds', () => {
     await refused;
     await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+  });
+
+  it('a mute and a quick unmute of one channel, both refused, leave it where program is', async () => {
+    refuseMixerWrites = { match: (props) => props['ch1_to_main'] !== undefined, ms: 150 };
+    await Promise.all([
+      send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true }),
+      send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false }),
+    ]);
+    refuseMixerWrites = null;
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+  });
+
+  it('takes a refused mute back out of the router when another channel\'s write carried it', async () => {
+    refuseMixerWrites = { match: (props) => props['ch1_to_main'] !== undefined, ms: 300 };
+    const refused = send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+    await refused;
+    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
   });
 
   it('sends router writes one at a time, the last one carrying every change', async () => {

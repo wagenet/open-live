@@ -6,10 +6,11 @@
  * copy the crew's routing (mute / audio-follow-video via `to_main`), the channel
  * mute set through the REST audio route, and the fader level.
  *
- * Callers record a change when they decide it, before the mixer write, so the
- * state follows the order changes were sent in rather than the order Strom
- * answered; a change the mixer rejected is undone. Router writes go out one at a
- * time per production, in the background, and each carries the state current
+ * Callers record a change when they decide it, before the mixer write, and
+ * settle or undo it when the mixer answers. Each channel's value is that of its
+ * newest change the mixer has not refused, so the state follows the order changes
+ * were sent in rather than the order Strom answered. Router writes go out one at
+ * a time per production, in the background, and each carries the state current
  * when it is sent.
  *
  * State is only written to a router once it is known to match the mixer: after
@@ -27,13 +28,29 @@ export type FastFeedChange =
   | { channel: number; muted: boolean }
   | { channel: number; gain: number };
 
+type Kind = 'toMain' | 'muted' | 'gain';
+type Value = boolean | number | undefined;
+interface Change { version: number; value: Value }
+
 interface ChannelState {
   offProgram: Set<number>;
   muted: Set<number>;
   gains: Map<number, number>;
-  /** Version of the last change per `<kind>:<channel>`, so an undo never reverts a newer change. */
-  versions: Map<string, number>;
+  /**
+   * Per `<kind>:<channel>`: the newest change the mixer accepted, and the changes
+   * it has not answered yet. The channel's value is the newest of these.
+   */
+  changes: Map<string, { settled: Change; unanswered: Change[] }>;
   nextVersion: number;
+  /** Router writes sent so far, so an undo knows whether one carried the change. */
+  routerWrites: number;
+}
+
+/** A recorded change, to settle once the mixer accepts it or undo if it refuses. */
+export interface FastFeedRecord {
+  settle(): void;
+  /** Returns whether a router write already carried the change, so the router needs writing again. */
+  undo(): boolean;
 }
 
 const stateByProduction = new Map<string, ChannelState>();
@@ -61,14 +78,11 @@ function writeRunFor(productionId: string): WriteRun {
 function stateFor(productionId: string): ChannelState {
   let s = stateByProduction.get(productionId);
   if (!s) {
-    s = { offProgram: new Set(), muted: new Set(), gains: new Map(), versions: new Map(), nextVersion: 1 };
+    s = { offProgram: new Set(), muted: new Set(), gains: new Map(), changes: new Map(), nextVersion: 1, routerWrites: 0 };
     stateByProduction.set(productionId, s);
   }
   return s;
 }
-
-type Kind = 'toMain' | 'muted' | 'gain';
-type Value = boolean | number | undefined;
 
 function kindOf(change: FastFeedChange): Kind {
   return 'toMain' in change ? 'toMain' : 'muted' in change ? 'muted' : 'gain';
@@ -94,32 +108,57 @@ function write(s: ChannelState, kind: Kind, ch: number, value: Value): void {
   }
 }
 
+function newest(c: { settled: Change; unanswered: Change[] }): Change {
+  return c.unanswered.reduce((a, b) => (b.version > a.version ? b : a), c.settled);
+}
+
+const NOTHING_RECORDED: FastFeedRecord = { settle: () => undefined, undo: () => false };
+
 /**
- * Records `changes` and returns a function that undoes them, for when the mixer
- * write they belong to fails. The undo skips any channel changed again since.
- * The router is written by `syncFastFeedRouter`.
+ * Records `changes` for a mixer write. Settle the record when the mixer accepts
+ * the write, and undo it when the mixer refuses; a change neither settled nor
+ * undone still counts. The router is written by `syncFastFeedRouter`.
  */
-export function recordFastFeedChanges(productionId: string, changes: Iterable<FastFeedChange>): () => void {
+export function recordFastFeedChanges(productionId: string, changes: Iterable<FastFeedChange>): FastFeedRecord {
   const list = [...changes];
-  if (list.length === 0) return () => undefined;
+  if (list.length === 0) return NOTHING_RECORDED;
   const s = stateFor(productionId);
-  const undo: Array<{ key: string; kind: Kind; channel: number; previous: Value; version: number }> = [];
-  for (const change of list) {
-    const kind = kindOf(change);
-    const key = `${kind}:${change.channel}`;
-    const version = s.nextVersion++;
-    undo.push({ key, kind, channel: change.channel, previous: read(s, kind, change.channel), version });
-    const value = 'toMain' in change ? change.toMain : 'muted' in change ? change.muted : change.gain;
-    write(s, kind, change.channel, value);
-    s.versions.set(key, version);
-  }
-  return () => {
-    for (const u of undo.reverse()) {
-      if (s.versions.get(u.key) !== u.version) continue;
-      write(s, u.kind, u.channel, u.previous);
-      s.versions.delete(u.key);
+  const recorded: Array<{ kind: Kind; channel: number; key: string; change: Change }> = [];
+  for (const c of list) {
+    const kind = kindOf(c);
+    const key = `${kind}:${c.channel}`;
+    let entry = s.changes.get(key);
+    if (!entry) {
+      entry = { settled: { version: 0, value: read(s, kind, c.channel) }, unanswered: [] };
+      s.changes.set(key, entry);
     }
+    const change = { version: s.nextVersion++, value: 'toMain' in c ? c.toMain : 'muted' in c ? c.muted : c.gain };
+    entry.unanswered.push(change);
+    write(s, kind, c.channel, newest(entry).value);
+    recorded.push({ kind, channel: c.channel, key, change });
+  }
+  const routerWritesBefore = s.routerWrites;
+  let answered = false;
+  const answer = (accepted: boolean): boolean => {
+    if (answered) return false;
+    answered = true;
+    let changed = false;
+    for (const r of recorded) {
+      const entry = s.changes.get(r.key)!;
+      entry.unanswered = entry.unanswered.filter((c) => c !== r.change);
+      if (accepted) {
+        if (r.change.version > entry.settled.version) entry.settled = r.change;
+        continue;
+      }
+      const value = newest(entry).value;
+      if (value !== read(s, r.kind, r.channel)) {
+        write(s, r.kind, r.channel, value);
+        changed = true;
+      }
+    }
+    return changed && s.routerWrites > routerWritesBefore;
   };
+  return { settle: () => { answer(true); }, undo: () => answer(false) };
 }
 
 /**
@@ -134,7 +173,6 @@ export function clearFastFeedState(productionId: string): void {
   waitingWrite.delete(productionId);
   writeRuns.delete(productionId);
 }
-
 
 /** Marks the production's channel state as matching its mixer, so it may be written to the router. */
 export function confirmFastFeedState(productionId: string): void {
@@ -179,6 +217,8 @@ export function syncFastFeedRouter(
     if (waitingWrite.get(productionId)?.write === next) waitingWrite.delete(productionId);
     if (writeRuns.get(productionId) !== run) return;
     const routing_matrix = fastFeedMatrix(productionId, router);
+    const s = stateByProduction.get(productionId);
+    if (s) s.routerWrites++;
     const sent = ++run.sent;
     const request = strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } });
     // Strom may answer writes out of order. One answered after a later write

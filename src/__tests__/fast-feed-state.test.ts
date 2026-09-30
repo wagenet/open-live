@@ -9,6 +9,7 @@ import {
   confirmFastFeedState,
   clearFastFeedState,
   syncFastFeedRouter,
+  fastFeedMatrix,
 } from '../services/fast-feed-state.js';
 import { fastRoutingMatrix } from '../lib/fast-returns.js';
 
@@ -109,5 +110,49 @@ describe('router writes across a stop and start', () => {
     confirmFastFeedState(PROD);
     await vi.advanceTimersByTimeAsync(5000); // the first write is answered now
     expect(writes).toEqual(['conv-1', 'conv-1']);
+  });
+});
+
+describe('a channel\'s value as the mixer answers its changes', () => {
+  const muteThenUnmute = () => [
+    recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]),
+    recordFastFeedChanges(PROD, [{ channel: 0, toMain: true }]),
+  ];
+  const closed = () => fastFeedMatrix(PROD, ROUTER) === fastRoutingMatrix(3, [1], new Set([0]));
+
+  it('keeps the newer change when the mixer accepts the older one last', () => {
+    const [mute, unmute] = muteThenUnmute();
+    unmute.settle();
+    mute.settle();
+    expect(closed()).toBe(false);
+    // A later refused cut goes back to the newer accepted change.
+    recordFastFeedChanges(PROD, [{ channel: 0, toMain: false }]).undo();
+    expect(closed()).toBe(false);
+  });
+
+  it('keeps the older change when the mixer accepts it and refuses the newer one', () => {
+    const [mute, unmute] = muteThenUnmute();
+    mute.settle();
+    unmute.undo();
+    expect(closed()).toBe(true);
+  });
+
+  it('keeps the newer change when the mixer refuses the older one', () => {
+    const [mute, unmute] = muteThenUnmute();
+    unmute.settle();
+    mute.undo();
+    expect(closed()).toBe(false);
+  });
+
+  it('goes back to the value before both when the mixer refuses both, in either order', () => {
+    const [mute, unmute] = muteThenUnmute();
+    unmute.undo();
+    mute.undo();
+    expect(closed()).toBe(false);
+
+    const [mute2, unmute2] = muteThenUnmute();
+    mute2.undo();
+    unmute2.undo();
+    expect(closed()).toBe(false);
   });
 });

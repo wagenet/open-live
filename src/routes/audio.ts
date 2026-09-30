@@ -162,7 +162,7 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
 
         const elemId = isMain ? `${mixerBlock2.id}:main_volume` : `${mixerBlock2.id}:volume_${(ch as number) - 1}`;
         const property = body.property === 'volume' ? 'volume' : 'mute';
-        const undoFast = ch !== null
+        const fast = ch !== null
           ? recordFastFeedChanges(req.params.id, [
             property === 'mute' ? { channel: ch - 1, muted: body.value === true } : { channel: ch - 1, gain: Number(body.value) },
           ])
@@ -174,11 +174,16 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           );
         } catch (err) {
           // A timed-out write may still have been applied; keep the fast feeds with it.
-          if (!(err instanceof StromTimeoutError)) undoFast?.();
-          else if (undoFast) void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+          if (err instanceof StromTimeoutError) fast?.settle();
+          if (fast && (err instanceof StromTimeoutError || fast.undo())) {
+            void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+          }
           throw err;
         }
-        if (undoFast) void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+        if (fast) {
+          fast.settle();
+          void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
+        }
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };
