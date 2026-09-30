@@ -5,8 +5,7 @@ import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { stoppedStatus } from '../lib/production-health.js';
 import type { ProductionDoc } from '../db/types.js';
-import { conversationFlowOwner } from '../lib/fast-returns.js';
-import { deactivateStromFlow } from '../lib/flow-generator.js';
+import { removeOrphanConversationFlows } from '../lib/fast-returns.js';
 
 /**
  * Startup reconciliation: cross-reference each production's stored stromFlowId
@@ -46,12 +45,8 @@ export async function reconcileProductionStatuses(
 
   // A conversation flow (fast return feeds) lives only as long as its program
   // flow; remove any whose program flow is gone.
-  for (const flow of liveFlows) {
-    const owner = conversationFlowOwner((flow.properties as { description?: string } | undefined)?.description);
-    if (owner && !liveFlowIds.has(owner)) {
-      await deactivateStromFlow(flow.id, strom);
-      log.info({ flowId: flow.id, programFlowId: owner }, '[reconcile] Removed orphaned conversation flow');
-    }
+  for (const flowId of await removeOrphanConversationFlows(strom, liveFlows)) {
+    log.info({ flowId }, '[reconcile] Removed orphaned conversation flow');
   }
 
   // Build a map from production ID → flow ID using the description tag every

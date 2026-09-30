@@ -1,3 +1,5 @@
+import type { StromClient } from './strom.js';
+
 /**
  * Low-latency ("fast") return feeds — `returnFeed.lowLatency`
  * (`docs/specs/guest-calling-intercom.md` §"Low-latency mode").
@@ -41,6 +43,8 @@ export interface FastReturnPlan {
   conversation: { blocks: Block[]; elements: Block[]; links: Link[] };
   /** Fast WHEP endpoint per guest. */
   entries: Array<{ mixerInput: string; endpointId: string }>;
+  /** The router block id and its output layout; the flow id is known once created. */
+  router: Omit<FastFeedRouter, 'flowId'>;
 }
 
 /**
@@ -98,16 +102,6 @@ export function planFastReturns(
     );
   });
 
-  // Crosspoint keys are `i<input>c<channel>` → [`o<output>c<channel>`], stereo.
-  const matrix: Record<string, string[]> = {};
-  returns.forEach((r, out) => {
-    for (let ch = 0; ch < channelSources.length; ch++) {
-      if (ch === r.ownChannel) continue;
-      for (const c of [0, 1]) {
-        (matrix[`i${ch}c${c}`] ??= []).push(`o${out}c${c}`);
-      }
-    }
-  });
   blocks.push({
     id: routerId,
     block_definition_id: 'builtin.liveaudiorouter',
@@ -118,7 +112,7 @@ export function planFastReturns(
       latency: FAST_ROUTER_LATENCY_MS,
       min_upstream_latency: FAST_ROUTER_MIN_UPSTREAM_LATENCY_MS,
       output_buffer_duration: FAST_ROUTER_OUTPUT_BUFFER_MS,
-      routing_matrix: JSON.stringify(matrix),
+      routing_matrix: fastRoutingMatrix(channelSources.length, returns.map((r) => r.ownChannel)),
     },
     position: { x: 600, y: 0 },
   });
@@ -138,7 +132,50 @@ export function planFastReturns(
     entries.push({ mixerInput: r.mixerInput, endpointId });
   });
 
-  return { programBlocks, programLinks, conversation: { blocks, elements, links }, entries };
+  return {
+    programBlocks,
+    programLinks,
+    conversation: { blocks, elements, links },
+    entries,
+    router: { blockId: routerId, numInputs: channelSources.length, ownChannels: returns.map((r) => r.ownChannel) },
+  };
+}
+
+/**
+ * The router's `routing_matrix`: output N sums every channel except
+ * `ownChannels[N]` and the channels the crew has taken off program.
+ * Crosspoint keys are `i<input>c<channel>` → [`o<output>c<channel>`], stereo.
+ *
+ * @param numInputs   audio channels on the router
+ * @param ownChannels 0-based own channel per router output
+ * @param offProgram  0-based channels whose `to_main` is currently off
+ */
+export function fastRoutingMatrix(
+  numInputs: number,
+  ownChannels: readonly number[],
+  offProgram: ReadonlySet<number> = new Set(),
+): string {
+  const matrix: Record<string, string[]> = {};
+  ownChannels.forEach((own, out) => {
+    for (let ch = 0; ch < numInputs; ch++) {
+      if (ch === own || offProgram.has(ch)) continue;
+      for (const c of [0, 1]) {
+        (matrix[`i${ch}c${c}`] ??= []).push(`o${out}c${c}`);
+      }
+    }
+  });
+  return JSON.stringify(matrix);
+}
+
+/** Where a running fast-feed router lives, persisted as `ProductionDoc.fastFeedRouter`. */
+export interface FastFeedRouter {
+  /** Conversation flow id. */
+  flowId: string;
+  /** The `builtin.liveaudiorouter` block id in that flow. */
+  blockId: string;
+  numInputs: number;
+  /** 0-based own channel per router output. */
+  ownChannels: number[];
 }
 
 /** `properties.description` of a production's conversation flow; ties it to the program flow. */
@@ -150,4 +187,24 @@ export function conversationFlowDescription(programFlowId: string): string {
 export function conversationFlowOwner(description: string | undefined): string | null {
   const m = /^conv:(.+)$/.exec(description ?? '');
   return m ? m[1]! : null;
+}
+
+/**
+ * Stops and deletes every conversation flow whose program flow is not among
+ * `flows` (Strom's current flow list). Returns the ids it removed.
+ */
+export async function removeOrphanConversationFlows(
+  strom: Pick<StromClient, 'flows'>,
+  flows: ReadonlyArray<{ id: string; properties?: unknown }>,
+): Promise<string[]> {
+  const live = new Set(flows.map((f) => f.id));
+  const removed: string[] = [];
+  for (const f of flows) {
+    const owner = conversationFlowOwner((f.properties as { description?: string } | undefined)?.description);
+    if (!owner || live.has(owner)) continue;
+    await strom.flows.stop(f.id).catch(() => undefined);
+    await strom.flows.delete(f.id).catch(() => undefined);
+    removed.push(f.id);
+  }
+  return removed;
 }

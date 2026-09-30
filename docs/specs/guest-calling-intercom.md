@@ -106,8 +106,9 @@ explicitly a later enhancement.
 ### Low-latency mode (after v1)
 
 `low-latency-minus` is for on-air conversation between guests: the minus mix on its own
-audio-only WHEP output, played by the client in place of the picture feed's audio. v1 accepts
-only `returnFeed.lowLatency: false`. Before it ships:
+audio-only WHEP output, played by the client in place of the picture feed's audio.
+`returnFeed.lowLatency: true` builds it (`src/lib/fast-returns.ts`), on Strom's audio bridge
+(Eyevinn/strom#844). Requirements it is built to:
 
 - **Absorb stalls after the jitterbuffer, not in it.** Each seat keeps one WHIP jitterbuffer
   at its quality setting (Strom's default is 400 ms), shared by program and the fast feed.
@@ -120,7 +121,7 @@ only `returnFeed.lowLatency: false`. Before it ships:
   absorbed downstream of the jitterbuffer, on the conversation path only: run at a low target
   latency, time-stretch audio to cover a stall rather than go silent, then play slightly fast
   until back at target. A prototype recovered a 400 ms stall with no skip and no added
-  dropout; nothing that does this is built yet.
+  dropout; Strom's audio bridge (Eyevinn/strom#844) does this.
 - **Conversation audio never airs.** What airs is each voice via the program path, buffered and
   unstretched; the conversation path governs only what guests hear of each other. It must
   never feed program output or a recording, because time-scaled audio cannot be recovered
@@ -407,8 +408,8 @@ implementation or in a dependent `open-live-studio` ticket.
   stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
   clean contributor). Open: the router feeds raw microphones, with no limiter unless
   Eyevinn/strom#795 lands. Measure path headroom first; see
-  [Low-latency mode](#low-latency-mode-after-v1). Only relevant once `low-latency-minus` ships;
-  v1 is `lowLatency: false`.
+  [Low-latency mode](#low-latency-mode-after-v1). Applies to assignments with
+  `returnFeed.lowLatency: true`.
 - **Guest auth model for invite links:** production-scoped, expiring, single-use vs reusable? This
   spec proposes signed (HMAC) expiring tokens stored as hashes — adopted as the implementation
   default.

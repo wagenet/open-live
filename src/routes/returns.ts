@@ -44,6 +44,27 @@ function returnStromUrl(doc: ProductionDoc, mixerInput: string, feed: FeedId = '
 /** Guest-session field that binds the guest's WHEP session id for a feed. */
 const SESSION_FIELD = { picture: 'returnWhepSessionId', fast: 'fastWhepSessionId' } as const;
 
+const MAX_BIND_ATTEMPTS = 3;
+
+/**
+ * Writes one feed's WHEP session id onto the guest session. Re-reads the doc on
+ * every attempt and retries a 409: a client opens the picture and fast feeds
+ * together, and a write from a stale snapshot would drop the other feed's binding.
+ */
+async function bindGuestWhepSession(sessionDocId: string, feed: FeedId, whepSessionId: string): Promise<void> {
+  const db = getGuestSessionsDb();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const current = await db.get(sessionDocId);
+      await db.insert({ ...current, [SESSION_FIELD[feed]]: whepSessionId, updatedAt: new Date().toISOString() });
+      return;
+    } catch (err) {
+      const conflict = (err as { statusCode?: number }).statusCode === 409;
+      if (!conflict || attempt >= MAX_BIND_ATTEMPTS) throw err;
+    }
+  }
+}
+
 /** Builds the crew/guest join-shape view of a return on an input. */
 function returnView(doc: ProductionDoc, mixerInput: string) {
   const assignment = doc.sources.find((s) => s.mixerInput === mixerInput);
@@ -172,11 +193,7 @@ const returnsRoutes: FastifyPluginAsync = async (fastify) => {
         // silently trusting an unbound id (see the DELETE handler below).
         if (req.guestScope && sessionId) {
           try {
-            await getGuestSessionsDb().insert({
-              ...req.guestScope.session,
-              [SESSION_FIELD[feed]]: sessionId,
-              updatedAt: new Date().toISOString(),
-            });
+            await bindGuestWhepSession(req.guestScope.session._id, feed, sessionId);
           } catch (err) {
             fastify.log.warn({ err, feed }, 'return WHEP: guest session-id bind failed');
           }

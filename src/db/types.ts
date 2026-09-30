@@ -1,4 +1,5 @@
 import type { PipConfig } from '../lib/strom.js';
+import type { FastFeedRouter } from '../lib/fast-returns.js';
 
 // --------------- Macro types ---------------
 
@@ -581,6 +582,8 @@ export interface ProductionDoc {
    * cleared on deactivate. Absent when the conversation flow did not start.
    */
   fastWhepUrls?: Array<{ mixerInput: string; url: string; endpointId: string }>;
+  /** The fast feeds' router in the conversation flow; crew mutes are mirrored into it. */
+  fastFeedRouter?: FastFeedRouter;
   /**
    * Open Intercom production/line grouping id — set when guest calling is
    * enabled for this production (epic #208, issue #299,

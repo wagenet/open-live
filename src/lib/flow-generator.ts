@@ -12,7 +12,14 @@ import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
-import { conversationFlowDescription, conversationFlowOwner, planFastReturns, type FastReturnPlan } from './fast-returns.js';
+import {
+  conversationFlowDescription,
+  conversationFlowOwner,
+  planFastReturns,
+  removeOrphanConversationFlows,
+  type FastFeedRouter,
+  type FastReturnPlan,
+} from './fast-returns.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -63,6 +70,8 @@ export interface ActivationResult {
    * flow could not start.
    */
   fastWhepEntries: Array<{ mixerInput: string; endpointId: string }>;
+  /** The running fast-feed router, when the conversation flow started. */
+  fastFeedRouter?: FastFeedRouter;
 }
 
 /** `builtin.mixer`'s own `min_upstream_latency` default (strom `types/src/mixer.rs`). */
@@ -188,6 +197,12 @@ export async function activateStromFlow(
     if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
     if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? 100 : Math.max(0, n); }
     return 100;
+  })();
+  const fastReturnLatencyMs = (() => {
+    const v = production.values?.fast_return_latency_ms;
+    if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
+    if (typeof v === 'string' && v !== '') { const n = parseInt(v, 10); return isNaN(n) ? undefined : Math.max(0, n); }
+    return undefined;
   })();
   const clockType = typeof production.values?.clock === 'string' && production.values.clock !== '' ? production.values.clock : undefined;
 
@@ -1004,7 +1019,7 @@ export async function activateStromFlow(
 
   // Fast return feeds (`returnFeed.lowLatency`): tap every audio channel's source
   // into a bridge here; the mix-minus and its WHEP outputs run in a separate
-  // conversation flow, created once this flow is playing.
+  // conversation flow, created once this flow has started.
   let fastPlan: FastReturnPlan | null = null;
   const fastRequests = returnBuses
     .filter((rb) => rb.assignment.returnFeed?.lowLatency === true)
@@ -1020,10 +1035,7 @@ export async function activateStromFlow(
       if (m) channelSources[parseInt(m[1]!, 10) - 1] = link['from'] as string;
     }
     const dense = channelSources.length > 0 && channelSources.every((pad) => typeof pad === 'string');
-    const target = production.values?.fast_return_latency_ms;
-    fastPlan = dense
-      ? planFastReturns(endpointSuffix, channelSources, fastRequests, typeof target === 'number' ? target : undefined)
-      : null;
+    fastPlan = dense ? planFastReturns(endpointSuffix, channelSources, fastRequests, fastReturnLatencyMs) : null;
     if (fastPlan) {
       flow.blocks.push(...fastPlan.programBlocks);
       flow.links.push(...fastPlan.programLinks);
@@ -1138,9 +1150,9 @@ export async function activateStromFlow(
     throw err;
   }
 
-  const fastWhepEntries = fastPlan
+  const fastFeedRouter = fastPlan
     ? await startConversationFlow(strom, flowId, `${flowName}-conv`, fastPlan, clockType)
-    : [];
+    : undefined;
 
   return {
     flowId,
@@ -1161,14 +1173,16 @@ export async function activateStromFlow(
       mode: rb.mode,
     })),
     returnWhepEntries,
-    fastWhepEntries,
+    fastWhepEntries: fastFeedRouter ? fastPlan!.entries : [],
+    ...(fastFeedRouter && { fastFeedRouter }),
   };
 }
 
 /**
- * Creates and starts the conversation flow that carries the fast return feeds.
- * A failure (for example a Strom without the audio bridge blocks) costs only the
- * fast feeds: the program flow keeps running and the picture feeds still work.
+ * Creates and starts the conversation flow that carries the fast return feeds,
+ * and returns where its router runs. A failure (for example a Strom without the
+ * audio bridge blocks) costs only the fast feeds: the program flow keeps running
+ * and the picture feeds still work.
  */
 async function startConversationFlow(
   strom: StromClient,
@@ -1176,7 +1190,14 @@ async function startConversationFlow(
   name: string,
   plan: FastReturnPlan,
   clockType: string | undefined,
-): Promise<FastReturnPlan['entries']> {
+): Promise<FastFeedRouter | undefined> {
+  // A conversation flow left behind by a failed teardown holds the same bridge
+  // channels and endpoint ids this one is about to claim.
+  try {
+    await removeOrphanConversationFlows(strom, (await strom.flows.list()).flows);
+  } catch {
+    // Strom did not list its flows; a leftover flow, if any, fails the start below.
+  }
   let flowId: string | undefined;
   try {
     const created = await strom.flows.create({
@@ -1196,11 +1217,11 @@ async function startConversationFlow(
     });
     flowId = created.flow.id;
     await strom.flows.start(flowId);
-    return plan.entries;
+    return { flowId, ...plan.router };
   } catch (err) {
     console.warn('[flow-generator] Conversation flow failed to start; fast return feeds unavailable:', err);
     if (flowId) await strom.flows.delete(flowId).catch(() => undefined);
-    return [];
+    return undefined;
   }
 }
 

@@ -26,6 +26,7 @@ import {
   type PersistedReturnBus,
   type ReturnMode,
 } from '../lib/return-feeds.js';
+import { fastRoutingMatrix } from '../lib/fast-returns.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -604,6 +605,9 @@ const afvChannelsByProduction = new Map<string, Set<string>>()
  */
 const mutedElementsByProduction = new Map<string, Set<string>>()
 
+/** Maps productionId → 0-based channels whose `to_main` is off (mutes and AFV), for the fast feeds' router. */
+const fastOffProgramByProduction = new Map<string, Set<number>>()
+
 /**
  * Last-seen stromFlowId per production.
  * A changed flowId means the pipeline was rebuilt (sources remapped, etc.) so
@@ -782,6 +786,7 @@ export function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
   afvRampByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
+  fastOffProgramByProduction.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
   sourceAudioOffsetsByProduction.delete(productionId)
@@ -1078,6 +1083,32 @@ async function applyAudioFollow(
     await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
       .catch((err) => console.warn('[controller] audio follow error:', String(err)));
   }
+  await mirrorToMainIntoFastFeeds(productionId, doc, toMainChanges, strom);
+}
+
+/**
+ * Mirrors `ch{N}_to_main` changes into the fast feeds' router (conversation flow),
+ * so a guest the crew took off program is not heard there either. Runs after the
+ * mixer update: a failure here leaves the mute in place on program and the
+ * picture feeds, and costs only the fast feeds' copy of it.
+ */
+async function mirrorToMainIntoFastFeeds(
+  productionId: string,
+  doc: ProductionDoc,
+  toMainChanges: ReadonlyMap<number, boolean>,
+  strom: StromClient,
+): Promise<void> {
+  const router = doc.fastFeedRouter;
+  if (!router || toMainChanges.size === 0) return;
+  let off = fastOffProgramByProduction.get(productionId);
+  if (!off) fastOffProgramByProduction.set(productionId, (off = new Set()));
+  for (const [ch, toMain] of toMainChanges) {
+    if (toMain) off.delete(ch);
+    else off.add(ch);
+  }
+  const routing_matrix = fastRoutingMatrix(router.numInputs, router.ownChannels, off);
+  await strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } })
+    .catch((err) => console.warn('[controller] fast feed mute mirror error:', String(err)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1938,6 +1969,10 @@ export async function handleMessage(
             properties: props,
             ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
           });
+          const chMute = /^ch(\d+)$/.exec(msg.elementId);
+          if (chMute) {
+            await mirrorToMainIntoFastFeeds(productionId, doc, new Map([[parseInt(chMute[1], 10) - 1, !msg.value]]), strom);
+          }
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
@@ -1979,6 +2014,7 @@ export async function handleMessage(
                 ),
               },
             }).catch((err) => console.warn('[controller] AFV_SET routing error:', err));
+            await mirrorToMainIntoFastFeeds(productionId, doc, new Map([[chIdx, isOnPgm]]), strom);
           }
         }
       } else {

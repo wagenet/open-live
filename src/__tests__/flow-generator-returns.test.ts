@@ -188,10 +188,12 @@ describe('activateStromFlow — per-guest return feeds', () => {
 describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  function makeTwoFlowStrom(opts: { conversationStartFails?: boolean } = {}) {
+  function makeTwoFlowStrom(opts: { conversationStartFails?: boolean; existing?: Array<{ id: string; properties: Record<string, unknown> }> } = {}) {
     const created: Record<string, unknown>[] = [];
     return {
       flows: {
+        list: vi.fn().mockResolvedValue({ flows: opts.existing ?? [] }),
+        stop: vi.fn().mockResolvedValue({}),
         create: vi.fn().mockImplementation((flow: Record<string, unknown>) => {
           created.push(flow);
           return Promise.resolve({ flow: { id: created.length === 1 ? 'flow-program' : 'flow-conv' } });
@@ -247,6 +249,34 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     // Only the lowLatency guest gets a fast feed; both keep their picture feed.
     expect(result.fastWhepEntries).toEqual([{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-test-onl' }]);
     expect(result.returnWhepEntries.map((e) => e.mixerInput)).toEqual(['video_in_1', 'video_in_2']);
+    expect(result.fastFeedRouter).toEqual({ flowId: 'flow-conv', blockId: router['id'], numInputs: 3, ownChannels: [1] });
+  });
+
+  it('removes a leftover conversation flow whose program flow is gone before creating its own', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    const strom = makeTwoFlowStrom({
+      existing: [
+        { id: 'flow-conv-leftover', properties: { description: 'conv:flow-gone' } },
+        { id: 'flow-live', properties: { description: 'prod:prod-b' } },
+        { id: 'flow-conv-live', properties: { description: 'conv:flow-live' } },
+      ],
+    });
+    await activateStromFlow(makeProduction(guests) as never, strom as never);
+    expect(strom.flows.delete.mock.calls.map((c) => c[0])).toEqual(['flow-conv-leftover']);
+    const deleteOrder = strom.flows.delete.mock.invocationCallOrder[0]!;
+    const convCreateOrder = strom.flows.create.mock.invocationCallOrder[1]!;
+    expect(deleteOrder).toBeLessThan(convCreateOrder);
+  });
+
+  it('reads fast_return_latency_ms given as a number or a string', async () => {
+    const { activateStromFlow } = await import('../lib/flow-generator.js');
+    for (const value of [80, '80']) {
+      const strom = makeTwoFlowStrom();
+      await activateStromFlow(makeProduction(guests, { fast_return_latency_ms: value }) as never, strom as never);
+      const bridges = (strom.created[1]!['blocks'] as Array<Record<string, unknown>>)
+        .filter((b) => b['block_definition_id'] === 'builtin.audio_bridge_input');
+      expect(bridges.map((b) => (b['properties'] as Record<string, unknown>)['target_latency_ms'])).toEqual([80, 80, 80]);
+    }
   });
 
   it('builds no conversation flow when no guest asks for a fast feed', async () => {
@@ -268,6 +298,7 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     const result = await activateStromFlow(makeProduction(guests) as never, strom as never);
     expect(result.flowId).toBe('flow-program');
     expect(result.fastWhepEntries).toEqual([]);
+    expect(result.fastFeedRouter).toBeUndefined();
     expect(strom.flows.delete).toHaveBeenCalledWith('flow-conv');
     expect(strom.flows.delete).not.toHaveBeenCalledWith('flow-program');
   });
@@ -292,5 +323,16 @@ describe('deactivateStromFlow — conversation flow', () => {
     await deactivateStromFlow('flow-program', strom as never);
     const deleted = strom.flows.delete.mock.calls.map((c) => c[0]);
     expect(deleted).toEqual(['flow-conv', 'flow-program']);
+  });
+});
+
+describe('fastRoutingMatrix', () => {
+  it('closes channels the crew took off program in every output, on top of each own channel', async () => {
+    const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
+    // Outputs for guests on channels 1 and 2; channel 0 muted.
+    expect(JSON.parse(fastRoutingMatrix(3, [1, 2], new Set([0])))).toEqual({
+      i2c0: ['o0c0'], i2c1: ['o0c1'],
+      i1c0: ['o1c0'], i1c1: ['o1c1'],
+    });
   });
 });
