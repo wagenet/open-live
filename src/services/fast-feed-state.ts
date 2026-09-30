@@ -84,9 +84,11 @@ function write(s: ChannelState, kind: Kind, ch: number, value: Value): void {
  * The router is written by `syncFastFeedRouter`.
  */
 export function recordFastFeedChanges(productionId: string, changes: Iterable<FastFeedChange>): () => void {
+  const list = [...changes];
+  if (list.length === 0) return () => undefined;
   const s = stateFor(productionId);
   const undo: Array<{ key: string; kind: Kind; channel: number; previous: Value; version: number }> = [];
-  for (const change of changes) {
+  for (const change of list) {
     const kind = kindOf(change);
     const key = `${kind}:${change.channel}`;
     const version = s.nextVersion++;
@@ -130,7 +132,8 @@ const ROUTER_WRITE_TIMEOUT_MS = 5000;
  * write already on its way. Callers do not wait for it: the crew's own feedback
  * never waits on the fast feeds. A write still waiting its turn picks up later
  * changes, so a slow router gets one write, not a backlog. A failure or timeout
- * is logged and costs only the fast feeds' copy of the change.
+ * is logged and costs only the fast feeds' copy of the change; a timed-out write
+ * that lands later is followed by a fresh one.
  *
  * @param onlyIfChanged skip the write when nothing has been recorded (the router
  *   was built with every channel open at unity)
@@ -150,16 +153,21 @@ export function syncFastFeedRouter(
   const next: Promise<void> = previous.then(async () => {
     if (waitingWrite.get(productionId)?.write === next) waitingWrite.delete(productionId);
     const routing_matrix = fastFeedMatrix(productionId, router);
+    const request = strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } });
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`timed out after ${ROUTER_WRITE_TIMEOUT_MS} ms`)), ROUTER_WRITE_TIMEOUT_MS);
+    let timedOut = false;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(() => { timedOut = true; resolve(); }, ROUTER_WRITE_TIMEOUT_MS);
     });
-    await Promise.race([
-      strom.flows.updateBlockProperties(router.flowId, router.blockId, { properties: { routing_matrix } }),
-      timeout,
-    ])
+    await Promise.race([request, timeout])
       .catch((err) => console.warn('[fast-feed] router update error:', String(err)))
       .finally(() => clearTimeout(timer));
+    if (timedOut) {
+      console.warn(`[fast-feed] router update timed out after ${ROUTER_WRITE_TIMEOUT_MS} ms`);
+      // The next write goes out now. Strom may still apply this one after it, so
+      // once it lands, write the current state again.
+      request.then(() => { void syncFastFeedRouter(productionId, router, strom); }, () => undefined);
+    }
   }).finally(() => {
     if (pendingWrite.get(productionId) === next) pendingWrite.delete(productionId);
   });

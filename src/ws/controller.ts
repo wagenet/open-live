@@ -1077,12 +1077,13 @@ async function applyAudioFollow(
     toMainChanges,
   ));
   // Recorded before the mixer write so rapid cuts land in the order they were made.
-  const undoFast = recordToMainForFastFeeds(productionId, toMainChanges);
+  const undoFast = toMainChanges.size > 0 ? recordToMainForFastFeeds(productionId, toMainChanges) : undefined;
   let mixerOk = true;
   if (Object.keys(properties).length > 0) {
     await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
       .catch((err) => { mixerOk = false; console.warn('[controller] audio follow error:', String(err)); });
   }
+  if (!undoFast) return;
   if (mixerOk) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
   else undoFast();
 }
@@ -2809,15 +2810,20 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
-              // The reset opens every channel at unity, so the fast feeds start from
-              // that; a crew change sent while it is on its way lands after it and is
-              // kept. The router may still hold what the crew set before a restart.
-              clearFastFeedState(id);
+              // The reset opens every channel at unity, and the fast feeds follow it
+              // like any crew change: a change sent while it is on its way lands
+              // after it and is kept, and a refused reset leaves the fast feeds as
+              // they were. The router may still hold what the crew set before a restart.
+              const undoFast = recordFastFeedChanges(id, Array.from({ length: numChannels }, (_, channel) => [
+                { channel, toMain: true }, { channel, muted: false }, { channel, gain: 1 },
+              ]).flat());
               const initOk = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
                 .then(() => true, (err) => { console.warn('[controller] init channel props error:', err); return false; });
               if (initOk) {
                 confirmFastFeedState(id);
                 void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
+              } else {
+                undoFast();
               }
             }
             // Restore fader levels and mute state.

@@ -55,6 +55,8 @@ let routerFails = false;
 let mixerFails = false;
 /** Answer the next mixer write this late (ms); Strom applies it on arrival either way. */
 let slowNextMixerReplyMs = 0;
+/** Answer the mixer write whose properties match this late (ms); Strom applies it on arrival. */
+let slowMixerWrite: { match: (props: Record<string, unknown>) => boolean; ms: number } | null = null;
 /** Refuse the next mixer write, this late (ms). */
 let failNextMixerAfterMs: number | null = null;
 let slowNextRouterReplyMs = 0;
@@ -84,6 +86,10 @@ const stromServer: Server = createServer((req, res) => {
     }
     let delay = 0;
     if (req.url === MIXER_PATH) { delay = slowNextMixerReplyMs; slowNextMixerReplyMs = 0; }
+    if (req.url === MIXER_PATH && slowMixerWrite?.match(body['properties'] as Record<string, unknown>)) {
+      delay = slowMixerWrite.ms;
+      slowMixerWrite = null;
+    }
     if (req.url === ROUTER_PATH) {
       delay = slowNextRouterReplyMs;
       slowNextRouterReplyMs = 0;
@@ -158,6 +164,7 @@ beforeEach(() => {
   routerFails = false;
   mixerFails = false;
   slowNextMixerReplyMs = 0;
+  slowMixerWrite = null;
   failNextMixerAfterMs = null;
   slowNextRouterReplyMs = 0;
   maxRouterInFlight = 0;
@@ -215,7 +222,8 @@ describe('crew mutes reach the fast return feeds', () => {
     await send({ type: 'AFV_SET', mixerInput: 'video_in_3', enabled: true });
     patches.length = 0;
 
-    slowNextMixerReplyMs = 200;
+    // The first cut's mixer write is answered after the second's.
+    slowMixerWrite = { match: (props) => props['ch3_to_main'] === true, ms: 200 };
     await send({ type: 'CUT', mixerInput: 'video_in_3' });
     await send({ type: 'CUT', mixerInput: 'video_in_1' });
     // applyAudioFollow is fired without awaiting; let both cuts' requests land.
@@ -223,6 +231,14 @@ describe('crew mutes reach the fast return feeds', () => {
     await vi.waitFor(() => expect(routerMatrices()).toHaveLength(2), { timeout: 2000 });
     await whenFastFeedRouterIdle(PROD);
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+  });
+
+  it('leaves the fast feeds alone on a cut with no channel following video', async () => {
+    setTally(PROD, { pgm: 'video_in_1', pvw: 'video_in_3' });
+    await send({ type: 'CUT', mixerInput: 'video_in_3' });
+    await new Promise((r) => setTimeout(r, 50));
+    await whenFastFeedRouterIdle(PROD);
+    expect(patches).toEqual([]);
   });
 
   it('a cut the mixer refused leaves the fast feeds where program still is', async () => {
@@ -301,6 +317,18 @@ describe('crew mutes reach the fast return feeds', () => {
     await whenFastFeedRouterIdle(PROD);
     expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([0])), fastRoutingMatrix(3, [1], new Set([0, 1, 2]))]);
   });
+
+  it('sends the next router write after a slow one times out, and writes again once the slow one lands', async () => {
+    slowNextRouterReplyMs = 5500;
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true }), ctx);
+    await handleMessage(PROD, ws, JSON.stringify({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true }), ctx);
+    const both = fastRoutingMatrix(3, [1], new Set([0, 2]));
+    // The second write goes out at the 5 s timeout, while the first is still unanswered.
+    await vi.waitFor(() => expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([0])), both]), { timeout: 5400, interval: 50 });
+    // Strom may apply the slow one last, so its reply is followed by the current state again.
+    await vi.waitFor(() => expect(routerMatrices()).toHaveLength(3), { timeout: 2000, interval: 50 });
+    expect(routerMatrices()[2]).toBe(both);
+  }, 10_000);
 
   it('sends nothing to the router until the state is known to match the mixer', async () => {
     clearAudioState(PROD); // a restart, before any controller has connected

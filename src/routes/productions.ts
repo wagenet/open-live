@@ -9,7 +9,7 @@ import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
-import { confirmFastFeedState, syncFastFeedRouter } from '../services/fast-feed-state.js';
+import { clearFastFeedState, confirmFastFeedState, syncFastFeedRouter } from '../services/fast-feed-state.js';
 import { config, isRecordingEnabled } from '../config.js';
 import { minioTargetFromConfig, uploadRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
@@ -509,6 +509,8 @@ async function runActivationFlow(
     }
 
     log.error({ err, productionId, stromFlowId }, 'Activation flow failed — resetting to inactive');
+    // Crew changes recorded while it was starting must not reach the next run's router.
+    clearFastFeedState(productionId);
 
     // Best-effort flow cleanup
     if (stromFlowId) {

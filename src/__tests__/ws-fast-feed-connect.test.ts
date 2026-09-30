@@ -233,6 +233,15 @@ describe('fast feeds after a server restart', () => {
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
   });
 
+  it('keeps the fast feeds following the crew when the first connect\'s reset is refused', async () => {
+    mixerFails = true;
+    await connectOnce();
+    mixerFails = false;
+    patches.length = 0;
+    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
+    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]))]);
+  });
+
   it('leaves the router alone on a later connect', async () => {
     await connectOnce();
     await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
