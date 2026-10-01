@@ -407,7 +407,9 @@ implementation or in a dependent `open-live-studio` ticket.
   dropout, the same as the control, while the program mixer took every contributor's audio to 7%
   dropout and shifted its own delay by 220 ms (Strom loopback rig, 0–200 ms jitter, 0.4–1.2 s
   stalls and about 13% burst loss on one WHIP publisher's packets, dropout of a test tone from a
-  clean contributor; measured with the router fed from each source, before the mixer). A direct
+  clean contributor; measured with the router fed from each source, before the mixer). Fed from
+  the direct outs, under the same impairment, the other contributors kept 0.14–0.17% dropout in
+  the fast feed against 0.13–0.21% for the control. A direct
   out taps its channel after the fader, mute and `to_main`, and before the Main sum, so no
   aggregator sits on the fast path and the crew's changes reach the fast feed inside Strom. The
   router is a fixed mix-minus. The fast feed therefore follows the whole channel strip,
