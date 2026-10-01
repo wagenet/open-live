@@ -140,6 +140,8 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     clipPlayerBlockIds: {},
     returnBuses: [],
     returnWhepEntries: [],
+    fastWhepEntries: [] as Array<{ mixerInput: string; endpointId: string }>,
+    fastFeedRouter: undefined as undefined | { flowId: string; blockId: string },
   };
 }
 
