@@ -149,18 +149,11 @@ const noAudioWarning = { type: 'recording-no-audio', message: 'Recording "VOD" h
 
 function activationResultWithWarning() {
   return {
-    flowId: 'flow-abc',
+    ...makeActivationResult('flow-abc', ''),
     mixerBlockId: null,
     audioMixerBlockId: null,
     loudnessMainBlockId: null,
     warnings: [noAudioWarning],
-    sourceOffsetBlockIds: {},
-    sourceAudioOffsetBlockIds: {},
-    clipPlayerBlockIds: {},
-    returnBuses: [],
-    returnWhepEntries: [],
-    fastWhepEntries: [] as Array<{ mixerInput: string; endpointId: string }>,
-    fastFeedRouter: undefined as undefined | { flowId: string; blockId: string },
   };
 }
 
