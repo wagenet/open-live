@@ -10,6 +10,7 @@ import { composeRtmpUrl } from './rtmp.js';
 import { safeFlowProjection } from './log-redact.js';
 import { VIRTUAL_SOURCES, assignAudioChannels } from './audio-channels.js';
 import { assignReturnBuses, returnSendMatrix } from './return-feeds.js';
+import { activationRecordingsDirName, productionRecordingsDir } from './recording-uploader.js';
 import { assignPortsToFlow, unassignPortsFromFlow } from '../services/port-reservation.js';
 import { listenerPortRequest } from '../services/listener-ports.js';
 
@@ -916,7 +917,9 @@ export async function activateStromFlow(
         // Per-production output directory: recorder writes
         // {media_path}/{output_dir}/{filename_prefix}_{timestamp}_%05d.{ext} (Strom recorder.rs). We key
         // it by production id so segments are trivially locatable + uploadable.
-        const outputDir = `recordings/${production._id}`;
+        // Each activation gets its own subdirectory, named by its start time, so
+        // deactivate can tell which activation recorded each file.
+        const outputDir = `${productionRecordingsDir(production._id)}/${activationRecordingsDirName()}`;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.recorder',
