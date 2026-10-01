@@ -9,7 +9,7 @@ import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState, clearFxState, clearClipStateForProduction } from '../ws/controller.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config, isObjectStorageConfigured } from '../config.js';
 import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
@@ -930,17 +930,22 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-        // VOD recording (issue #41): when a recorder block is active, finalise
-        // the current segment (recorder.splitNow) then upload Strom's local
-        // recordings to MinIO — Strom's recorder has no native S3 sink, so
-        // open-live pulls the segments and pushes them to object storage.
-        // Every activation's directory is swept, skipping objects already
-        // registered, so a session whose upload failed (or that ended without
-        // this route, e.g. the idle watchdog) is uploaded here instead of lost.
+        // VOD recording (issue #41): Strom's recorder has no native S3 sink, so
+        // open-live finalises the current segment (recorder.splitNow) and pulls
+        // Strom's local recordings into object storage. Every activation's
+        // directory is swept, skipping objects already registered, so a session
+        // whose upload failed (or that ended without this route, e.g. the idle
+        // watchdog) is uploaded here instead of lost. Without object storage the
+        // recordings stay on Strom's media path and teardown proceeds immediately.
         // Best-effort: a failed upload must not block deactivation/teardown.
-        if (isRecordingEnabled()) {
+        if (doc.recorderBlockId || isObjectStorageConfigured()) {
           const target = minioTargetFromConfig();
-          if (target) {
+          if (!target) {
+            req.log.info(
+              { productionId: doc._id, outputDir: `recordings/${doc._id}` },
+              'VOD recordings kept on Strom — object storage not configured, skipping upload',
+            );
+          } else {
             try {
               if (doc.recorderBlockId) {
                 await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
