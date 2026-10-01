@@ -2285,10 +2285,6 @@ paths:
           description: Not found
     patch:
       summary: Update audio element property
-      description: >
-        Sets a channel's (`ch<N>`) or the main bus's volume or mute. A channel
-        change also reaches the production's fast return feeds, where a volume
-        above 1.0 plays at 1.0.
       operationId: updateAudioElement
       tags: [Audio]
       requestBody:

@@ -58,7 +58,6 @@ const mockStromFlowsGet = vi.fn();
 const mockStromMixerMultiviewEndpoint = vi.fn();
 const mockStromSystemIceServers = vi.fn();
 const mockStromSystemVersion = vi.fn();
-const mockStromUpdateBlockProperties = vi.fn().mockResolvedValue({});
 
 vi.mock('../lib/strom.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/strom.js')>();
@@ -72,7 +71,6 @@ vi.mock('../lib/strom.js', async (importOriginal) => {
       start: vi.fn().mockResolvedValue({}),
       stop: vi.fn().mockResolvedValue({}),
       delete: vi.fn().mockResolvedValue({}),
-      updateBlockProperties: mockStromUpdateBlockProperties,
     };
     mixer = {
       multiviewEndpoint: mockStromMixerMultiviewEndpoint,
@@ -136,7 +134,7 @@ function makeActivationResult(flowId: string, mixerBlockId: string) {
     returnBuses: [],
     returnWhepEntries: [],
     fastWhepEntries: [] as Array<{ mixerInput: string; endpointId: string }>,
-    fastFeedRouter: undefined as undefined | { flowId: string; blockId: string; numInputs: number; ownChannels: number[] },
+    fastFeedRouter: undefined as undefined | { flowId: string; blockId: string },
   };
 }
 
@@ -403,7 +401,7 @@ describe('activation — fast return feeds (returnFeed.lowLatency)', () => {
   }
 
   it('stores the fast feed URLs and the router', async () => {
-    const router = { flowId: 'flow-conv', blockId: 'b-fast-router-x', numInputs: 3, ownChannels: [1] };
+    const router = { flowId: 'flow-conv', blockId: 'b-fast-router-x' };
     const doc = await activate(makeProductionDoc(), {
       ...makeActivationResult('flow-1', 'mixer-1'),
       fastWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-x' }],
@@ -420,71 +418,12 @@ describe('activation — fast return feeds (returnFeed.lowLatency)', () => {
     const doc = await activate(
       makeProductionDoc({
         fastWhepUrls: [{ mixerInput: 'video_in_1', url: 'http://localhost:7000/whep/whep-fast-1-x', endpointId: 'whep-fast-1-x' }],
-        fastFeedRouter: { flowId: 'flow-conv-old', blockId: 'b', numInputs: 3, ownChannels: [1] },
+        fastFeedRouter: { flowId: 'flow-conv-old', blockId: 'b' },
       }),
       makeActivationResult('flow-2', 'mixer-2'),
     );
     expect(doc.fastWhepUrls).toBeUndefined();
     expect(doc.fastFeedRouter).toBeUndefined();
-  });
-
-  it('puts a mute or fader move made while the flow was starting into the new router', async () => {
-    const { recordFastFeedChanges, clearFastFeedState } = await import('../services/fast-feed-state.js');
-    const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
-    mockStromUpdateBlockProperties.mockClear();
-    recordFastFeedChanges('prod-test-1', [{ channel: 0, toMain: false }, { channel: 2, gain: 0.5 }]);
-    try {
-      const router = { flowId: 'flow-conv', blockId: 'b-fast-router-x', numInputs: 3, ownChannels: [1] };
-      await activate(makeProductionDoc(), {
-        ...makeActivationResult('flow-1', 'mixer-1'),
-        fastWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-x' }],
-        fastFeedRouter: router,
-      });
-      expect(mockStromUpdateBlockProperties).toHaveBeenCalledWith('flow-conv', 'b-fast-router-x', {
-        properties: { routing_matrix: fastRoutingMatrix(3, [1], new Set([0]), new Map([[2, 0.5]])) },
-      });
-    } finally {
-      clearFastFeedState('prod-test-1');
-    }
-  });
-
-  it('drops changes made during a start that failed, so the next run\'s router is left alone', async () => {
-    const { recordFastFeedChanges, clearFastFeedState } = await import('../services/fast-feed-state.js');
-    let currentDoc: Record<string, unknown> = makeProductionDoc();
-    mockGet.mockImplementation(async () => ({ ...currentDoc }));
-    mockInsert.mockImplementation(async (d: Record<string, unknown>) => {
-      currentDoc = { ...d };
-      return { rev: `rev-${Date.now()}`, ok: true, id: d._id as string };
-    });
-    recordFastFeedChanges('prod-test-1', [{ channel: 0, toMain: false }]);
-    try {
-      mockActivateStromFlow.mockRejectedValueOnce(new Error('flow refused'));
-      const app = await buildServer();
-      await app.inject({ method: 'POST', url: '/api/v1/productions/prod-test-1/activate' });
-      for (let i = 0; i < 50 && currentDoc.status !== 'inactive'; i++) await new Promise((r) => setTimeout(r, 0));
-      await app.close();
-      expect(currentDoc.status).toBe('inactive');
-
-      mockStromUpdateBlockProperties.mockClear();
-      await activate(currentDoc, {
-        ...makeActivationResult('flow-1', 'mixer-1'),
-        fastWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-x' }],
-        fastFeedRouter: { flowId: 'flow-conv', blockId: 'b-fast-router-x', numInputs: 3, ownChannels: [1] },
-      });
-      expect(mockStromUpdateBlockProperties).not.toHaveBeenCalled();
-    } finally {
-      clearFastFeedState('prod-test-1');
-    }
-  });
-
-  it('leaves a new router alone when the crew changed nothing while it started', async () => {
-    mockStromUpdateBlockProperties.mockClear();
-    await activate(makeProductionDoc(), {
-      ...makeActivationResult('flow-1', 'mixer-1'),
-      fastWhepEntries: [{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-x' }],
-      fastFeedRouter: { flowId: 'flow-conv', blockId: 'b-fast-router-x', numInputs: 3, ownChannels: [1] },
-    });
-    expect(mockStromUpdateBlockProperties).not.toHaveBeenCalled();
   });
 });
 

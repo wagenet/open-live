@@ -5,7 +5,6 @@ import { loadAudioChannels } from '../lib/audio-channels.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
-import { recordFastFeedChanges, syncFastFeedRouter } from '../services/fast-feed-state.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
@@ -15,15 +14,11 @@ const AudioPatch = z.object({
 
 const MIXER_BLOCK_TYPE = 'builtin.mixer';
 
-class StromTimeoutError extends Error {
-  constructor() { super('Strom request timed out'); }
-}
-
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new StromTimeoutError()), ms),
+      setTimeout(() => reject(new Error('Strom request timed out')), ms),
     ),
   ]);
 }
@@ -162,27 +157,10 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
 
         const elemId = isMain ? `${mixerBlock2.id}:main_volume` : `${mixerBlock2.id}:volume_${(ch as number) - 1}`;
         const property = body.property === 'volume' ? 'volume' : 'mute';
-        const fast = ch !== null
-          ? recordFastFeedChanges(req.params.id, [
-            property === 'mute' ? { channel: ch - 1, muted: body.value === true } : { channel: ch - 1, gain: Number(body.value) },
-          ])
-          : undefined;
-        try {
-          await withTimeout(
-            strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
-            5000,
-          );
-        } catch (err) {
-          // A timed-out write may still have been applied; undo keeps the fast feeds with it.
-          if (fast?.undo(err)) {
-            void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
-          }
-          throw err;
-        }
-        if (fast) {
-          fast.settle();
-          void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
-        }
+        await withTimeout(
+          strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
+          5000,
+        );
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };

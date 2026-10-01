@@ -1018,9 +1018,9 @@ export async function activateStromFlow(
     }
   }
 
-  // Fast return feeds (`returnFeed.lowLatency`): tap every audio channel's source
-  // into a bridge here; the mix-minus and its WHEP outputs run in a separate
-  // conversation flow, created once this flow has started.
+  // Fast return feeds (`returnFeed.lowLatency`): tap every audio channel's
+  // direct out into a bridge here; the mix-minus and its WHEP outputs run in a
+  // separate conversation flow, created once this flow has started.
   let fastPlan: FastReturnPlan | null = null;
   const fastRequests = returnBuses
     .filter((rb) => rb.assignment.returnFeed?.lowLatency === true)
@@ -1028,25 +1028,30 @@ export async function activateStromFlow(
       const padMatch = /video_in_(\d+)$/.exec(rb.assignment.mixerInput);
       return { mixerInput: rb.assignment.mixerInput, padIndex: padMatch ? parseInt(padMatch[1]!, 10) : 0, ownChannel: rb.ownChannel };
     });
-  if (audioMixerBlockId && fastRequests.length > 0) {
+  if (audioMixerBlock && audioMixerBlockId && fastRequests.length > 0) {
     const inputPad = new RegExp(`^${audioMixerBlockId}:input_(\\d+)$`);
-    const channelSources: string[] = [];
+    const linkedInputs: boolean[] = [];
     for (const link of flow.links as Array<Record<string, unknown>>) {
       const m = inputPad.exec((link['to'] as string | undefined) ?? '');
-      if (m) channelSources[parseInt(m[1]!, 10) - 1] = link['from'] as string;
+      if (m) linkedInputs[parseInt(m[1]!, 10) - 1] = true;
     }
-    const dense = channelSources.length > 0 && channelSources.every((pad) => typeof pad === 'string');
+    const numChannels = linkedInputs.length;
+    const dense = numChannels > 0 && Array.from(linkedInputs).every((linked) => linked === true);
     if (!dense) {
       console.warn('[flow-generator] Fast return feeds skipped: an audio channel has no source link');
-    } else if (channelSources.length > FAST_ROUTER_MAX_STREAMS) {
+    } else if (numChannels > FAST_ROUTER_MAX_STREAMS) {
       // Every fast feed's guest is one of these channels, so the outputs fit too.
       console.warn(
-        `[flow-generator] Fast return feeds skipped: ${channelSources.length} audio channels, ` +
+        `[flow-generator] Fast return feeds skipped: ${numChannels} audio channels, ` +
         `but the router takes at most ${FAST_ROUTER_MAX_STREAMS}`,
       );
     } else {
-      fastPlan = planFastReturns(endpointSuffix, channelSources, fastRequests, fastReturnLatencyMs);
+      fastPlan = planFastReturns(endpointSuffix, audioMixerBlockId, numChannels, fastRequests, fastReturnLatencyMs);
       if (fastPlan) {
+        // Construction-time: each channel gets a `direct_out_N` pad (Eyevinn/strom#930).
+        const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+        props['direct_outs'] = true;
+        audioMixerBlock['properties'] = props;
         flow.blocks.push(...fastPlan.programBlocks);
         flow.links.push(...fastPlan.programLinks);
       }
@@ -1189,9 +1194,10 @@ export async function activateStromFlow(
 
 /**
  * Creates and starts the conversation flow that carries the fast return feeds,
- * and returns where its router runs. A failure (for example a Strom without the
- * audio bridge blocks) costs only the fast feeds: the program flow keeps running
- * and the picture feeds still work.
+ * and returns where its router runs. A failure here costs only the fast feeds:
+ * the program flow keeps running and the picture feeds still work. (A Strom
+ * without the audio bridge blocks or the mixer's direct outs fails the program
+ * flow itself, since the bridge outputs and their links are part of it.)
  */
 async function startConversationFlow(
   strom: StromClient,
@@ -1226,7 +1232,7 @@ async function startConversationFlow(
     });
     flowId = created.flow.id;
     await strom.flows.start(flowId);
-    return { flowId, ...plan.router };
+    return { flowId, blockId: plan.routerBlockId };
   } catch (err) {
     console.warn('[flow-generator] Conversation flow failed to start; fast return feeds unavailable:', err);
     if (flowId) await strom.flows.delete(flowId).catch(() => undefined);

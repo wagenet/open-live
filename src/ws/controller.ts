@@ -26,10 +26,6 @@ import {
   type PersistedReturnBus,
   type ReturnMode,
 } from '../lib/return-feeds.js';
-import {
-  recordFastFeedChanges, fillFastFeedFromMixer, fastFeedReadMark, clearFastFeedState, confirmFastFeedState,
-  syncFastFeedRouter, setFastFeedChecker, requestFastFeedCheck, mixerRefused, type FastFeedChange, type FastFeedRecord,
-} from '../services/fast-feed-state.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin, resetIdleTimer } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -609,12 +605,6 @@ const afvChannelsByProduction = new Map<string, Set<string>>()
 const mutedElementsByProduction = new Map<string, Set<string>>()
 
 /**
- * Productions whose first connect's reset the mixer refused, so the fast feeds'
- * channel state is not known to match the mixer. The next mixer read fills it.
- */
-const fastFeedAwaitingMixerRead = new Set<string>()
-
-/**
  * Last-seen stromFlowId per production.
  * A changed flowId means the pipeline was rebuilt (sources remapped, etc.) so
  * any cached channel-index state is invalid and must be cleared immediately
@@ -792,8 +782,6 @@ export function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
   afvRampByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
-  clearFastFeedState(productionId)
-  fastFeedAwaitingMixerRead.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
   sourceAudioOffsetsByProduction.delete(productionId)
@@ -1086,51 +1074,10 @@ async function applyAudioFollow(
     (doc.returnBuses ?? []) as PersistedReturnBus[],
     toMainChanges,
   ));
-  // Recorded before the mixer write so rapid cuts land in the order they were made.
-  const fast = toMainChanges.size > 0 ? recordToMainForFastFeeds(productionId, toMainChanges) : undefined;
-  const failure = Object.keys(properties).length === 0 ? undefined
-    : await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
-      .then(() => undefined, (err: unknown) => { console.warn('[controller] audio follow error:', String(err)); return { err }; });
-  if (!fast) return;
-  if (!failure) fast.settle();
-  if (!failure || fast.undo(failure.err)) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
-}
-
-/**
- * Each channel's routing, mute and fader as a mixer read reports them, or null
- * when the read is missing any of them (a pipeline that is not running reads as
- * empty).
- */
-function fastFeedChangesFromMixer(p: Record<string, unknown>, numChannels: number): FastFeedChange[] | null {
-  const changes: FastFeedChange[] = [];
-  for (let i = 1; i <= numChannels; i++) {
-    const toMain = p[`ch${i}_to_main`], muted = p[`ch${i}_mute`], gain = p[`ch${i}_fader`];
-    if (typeof toMain !== 'boolean' || typeof muted !== 'boolean' || typeof gain !== 'number') return null;
-    changes.push({ channel: i - 1, toMain }, { channel: i - 1, muted }, { channel: i - 1, gain });
+  if (Object.keys(properties).length > 0) {
+    await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
+      .catch((err) => console.warn('[controller] audio follow error:', String(err)));
   }
-  return numChannels > 0 ? changes : null;
-}
-
-// A check reads the mixer the production's fast feeds follow. The router taps
-// every audio channel, so its input count is the mixer's channel count.
-setFastFeedChecker(async (productionId) => {
-  const doc = await getDb().get(productionId) as ProductionDoc;
-  const router = doc.fastFeedRouter;
-  if (!doc.stromFlowId || !doc.audioMixerBlockId || !router) return null;
-  const strom = await makeStromClient();
-  const { properties } = await strom.flows.getBlockProperties(doc.stromFlowId, doc.audioMixerBlockId);
-  return { changes: fastFeedChangesFromMixer(properties, router.numInputs), router, strom };
-});
-
-/**
- * Records `ch{N}_to_main` changes for the fast feeds' router (conversation flow),
- * so a guest the crew took off program is not heard there either. Call before
- * the mixer write. When it succeeds, settle the record and sync the router; when
- * it fails, undo it and sync if the undo changed anything. A router failure leaves the change in place on program and the
- * picture feeds, and costs only the fast feeds' copy of it.
- */
-function recordToMainForFastFeeds(productionId: string, toMainChanges: ReadonlyMap<number, boolean>): FastFeedRecord {
-  return recordFastFeedChanges(productionId, [...toMainChanges].map(([channel, toMain]) => ({ channel, toMain })));
 }
 
 // ---------------------------------------------------------------------------
@@ -1950,21 +1897,9 @@ export async function handleMessage(
             try {
               const s = await makeStromClient();
               const propName = capturedLogicalId === 'main' ? 'main_fader' : `ch${ch}_fader`;
-              const fast = ch !== null && typeof capturedValue === 'number'
-                ? recordFastFeedChanges(productionId, [{ channel: ch - 1, gain: capturedValue }])
-                : undefined;
-              try {
-                await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
-                  properties: { [propName]: capturedValue },
-                });
-              } catch (err) {
-                if (fast?.undo(err)) void syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
-                throw err;
-              }
-              if (fast) {
-                fast.settle();
-                void syncFastFeedRouter(productionId, doc.fastFeedRouter, s);
-              }
+              await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+                properties: { [propName]: capturedValue },
+              });
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
               broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
@@ -1999,23 +1934,10 @@ export async function handleMessage(
               new Map([[ch - 1, !msg.value]]),
             ));
           }
-          const chMute = /^ch(\d+)$/.exec(msg.elementId);
-          const fast = chMute
-            ? recordToMainForFastFeeds(productionId, new Map([[parseInt(chMute[1], 10) - 1, !msg.value]]))
-            : undefined;
-          try {
-            await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
-              properties: props,
-              ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
-            });
-          } catch (err) {
-            if (fast?.undo(err)) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
-            throw err;
-          }
-          if (fast) {
-            fast.settle();
-            void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
-          }
+          await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
+            properties: props,
+            ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
+          });
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
         }
       } catch (err) {
@@ -2047,8 +1969,7 @@ export async function handleMessage(
             mutedElementsByProduction.get(productionId)?.delete(elementId);
             broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'mute', value: false });
             const strom = await makeStromClient();
-            const fast = recordToMainForFastFeeds(productionId, new Map([[chIdx, isOnPgm]]));
-            const failure = await strom.flows.updateBlockProperties(doc.stromFlowId, `${ctx.audioBlockId}`, {
+            await strom.flows.updateBlockProperties(doc.stromFlowId, `${ctx.audioBlockId}`, {
               properties: {
                 [`ch${chIdx + 1}_to_main`]: isOnPgm,
                 // Mirror into returns in the same update (spec §"Mirror `to_main`").
@@ -2057,9 +1978,7 @@ export async function handleMessage(
                   new Map([[chIdx, isOnPgm]]),
                 ),
               },
-            }).then(() => undefined, (err: unknown) => { console.warn('[controller] AFV_SET routing error:', err); return { err }; });
-            if (!failure) fast.settle();
-            if (!failure || fast.undo(failure.err)) void syncFastFeedRouter(productionId, doc.fastFeedRouter, strom);
+            }).catch((err) => console.warn('[controller] AFV_SET routing error:', err));
           }
         }
       } else {
@@ -2849,26 +2768,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               initProps['main_fader'] = 1.0;
               levelCache.set('main', 1.0);
               channelLevelsByProduction.set(id, levelCache);
-              // The reset opens every channel at unity, and the fast feeds follow it
-              // like any crew change: a change sent while it is on its way lands
-              // after it and is kept. After a refused reset, the fast feeds take their
-              // state from a mixer read: the one below, or a check's. An unanswered
-              // reset may have been applied, so it counts until a check reads the
-              // mixer. The router may still hold what the crew set before a restart.
-              const fast = recordFastFeedChanges(id, Array.from({ length: numChannels }, (_, channel) => [
-                { channel, toMain: true }, { channel, muted: false }, { channel, gain: 1 },
-              ]).flat());
-              const initFailure = await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
-                .then(() => undefined, (err: unknown) => { console.warn('[controller] init channel props error:', err); return { err }; });
-              if (!initFailure || !mixerRefused(initFailure.err)) {
-                fast.settle();
-                confirmFastFeedState(id);
-                void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
-                if (initFailure) requestFastFeedCheck(id);
-              } else {
-                if (fast.undo(initFailure.err)) void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
-                fastFeedAwaitingMixerRead.add(id);
-              }
+              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .catch((err) => console.warn('[controller] init channel props error:', err));
             }
             // Restore fader levels and mute state.
             // Server-side cache (channelLevelsByProduction) is authoritative — it is updated
@@ -2877,20 +2778,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             // values set before the server started (e.g. pipeline defaults).
             const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
             const levelCache = channelLevelsByProduction.get(id);
-            const readMark = fastFeedReadMark(id);
             const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
-            if (blockProps && fastFeedAwaitingMixerRead.has(id)) {
-              // The reset was refused, so take the fast feeds' state from what the
-              // mixer holds. A read missing any channel's values (a pipeline that is
-              // not running reads as empty) leaves it to a check or the next connect.
-              const changes = fastFeedChangesFromMixer(blockProps.properties, numChannels);
-              if (changes) {
-                fastFeedAwaitingMixerRead.delete(id);
-                fillFastFeedFromMixer(id, changes, readMark);
-                confirmFastFeedState(id);
-                void syncFastFeedRouter(id, connectDoc.fastFeedRouter, strom);
-              }
-            }
             for (let i = 1; i <= numChannels; i++) {
               const cachedLevel = levelCache?.get(`ch${i}`);
               const stromLevel = blockProps?.properties[`ch${i}_fader`];

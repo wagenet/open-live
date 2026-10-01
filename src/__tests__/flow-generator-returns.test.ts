@@ -212,7 +212,7 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     { sourceId: 'Whip', mixerInput: 'video_in_2', returnFeed: { synced: 'program-minus' as const } },
   ];
 
-  it('taps every audio channel into a bridge and builds the mix-minus in a conversation flow', async () => {
+  it('taps every audio channel\'s direct out into a bridge and builds the mix-minus in a conversation flow', async () => {
     const { activateStromFlow } = await import('../lib/flow-generator.js');
     const strom = makeTwoFlowStrom();
     const result = await activateStromFlow(makeProduction(guests) as never, strom as never);
@@ -221,15 +221,22 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     const program = strom.created[0]!;
     const pBlocks = program['blocks'] as Array<Record<string, unknown>>;
     const pLinks = program['links'] as Array<{ from: string; to: string }>;
-    const mixerId = auxMixer(pBlocks)['id'] as string;
+    const mixer = auxMixer(pBlocks);
+    const mixerId = mixer['id'] as string;
+    expect((mixer['properties'] as Record<string, unknown>)['direct_outs']).toBe(true);
 
-    // One bridge output per audio channel, fed from the same pad as that mixer channel.
+    // One bridge output per audio channel, fed from that channel's direct out
+    // (1-based, like input_N), and from nothing else.
     const bridgeOuts = pBlocks.filter((b) => b['block_definition_id'] === 'builtin.audio_bridge_output');
     expect(bridgeOuts).toHaveLength(3);
     for (let ch = 0; ch < 3; ch++) {
-      const mixerFeed = pLinks.find((l) => l.to === `${mixerId}:input_${ch + 1}`)!;
       const bridge = bridgeOuts.find((b) => (b['properties'] as Record<string, unknown>)['channel'] === `fast-test-onl-${ch}`)!;
-      expect(pLinks).toContainEqual({ from: mixerFeed.from, to: `${bridge['id'] as string}:audio_in` });
+      expect(pLinks.filter((l) => l.to === `${bridge['id'] as string}:audio_in`))
+        .toEqual([{ from: `${mixerId}:direct_out_${ch + 1}`, to: `${bridge['id'] as string}:audio_in` }]);
+      // The bridge carries the channel the router's audio_in_<ch> expects.
+      const bridgeIn = (strom.created[1]!['blocks'] as Array<Record<string, unknown>>)
+        .find((b) => b['block_definition_id'] === 'builtin.audio_bridge_input' && (b['properties'] as Record<string, unknown>)['channel'] === `fast-test-onl-${ch}`)!;
+      expect(bridgeIn['id']).toBe(`b-fast-bridge-in-${ch}-test-onl`);
     }
 
     const conv = strom.created[1]!;
@@ -249,7 +256,7 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     // Only the lowLatency guest gets a fast feed; both keep their picture feed.
     expect(result.fastWhepEntries).toEqual([{ mixerInput: 'video_in_1', endpointId: 'whep-fast-1-test-onl' }]);
     expect(result.returnWhepEntries.map((e) => e.mixerInput)).toEqual(['video_in_1', 'video_in_2']);
-    expect(result.fastFeedRouter).toEqual({ flowId: 'flow-conv', blockId: router['id'], numInputs: 3, ownChannels: [1] });
+    expect(result.fastFeedRouter).toEqual({ flowId: 'flow-conv', blockId: router['id'] });
   });
 
   it('removes a leftover conversation flow whose program flow is gone before creating its own', async () => {
@@ -289,6 +296,7 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
     expect(strom.created).toHaveLength(1);
     const blocks = strom.created[0]!['blocks'] as Array<Record<string, unknown>>;
     expect(blocks.some((b) => b['block_definition_id'] === 'builtin.audio_bridge_output')).toBe(false);
+    expect(auxMixer(blocks)['properties']).not.toHaveProperty('direct_outs');
     expect(result.fastWhepEntries).toEqual([]);
   });
 
@@ -305,6 +313,7 @@ describe('activateStromFlow — fast return feeds (returnFeed.lowLatency)', () =
       expect(strom.created).toHaveLength(1);
       const blocks = strom.created[0]!['blocks'] as Array<Record<string, unknown>>;
       expect(blocks.some((b) => b['block_definition_id'] === 'builtin.audio_bridge_output')).toBe(false);
+      expect(auxMixer(blocks)['properties']).not.toHaveProperty('direct_outs');
       expect(result.fastWhepEntries).toEqual([]);
     }
 
@@ -351,21 +360,13 @@ describe('deactivateStromFlow — conversation flow', () => {
 });
 
 describe('fastRoutingMatrix', () => {
-  it('closes channels the crew took off program in every output, on top of each own channel', async () => {
+  it('opens every other channel at unity in each output and closes only the guest\'s own', async () => {
     const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
-    // Outputs for guests on channels 1 and 2; channel 0 muted.
-    expect(JSON.parse(fastRoutingMatrix(3, [1, 2], new Set([0])))).toEqual({
-      i2c0: ['o0c0'], i2c1: ['o0c1'],
+    // Outputs for guests on channels 1 and 2 of 3.
+    expect(JSON.parse(fastRoutingMatrix(3, [1, 2]))).toEqual({
+      i0c0: ['o0c0', 'o1c0'], i0c1: ['o0c1', 'o1c1'],
       i1c0: ['o1c0'], i1c1: ['o1c1'],
-    });
-  });
-
-  it('gives a channel below unity its fader level, closes it at zero and caps it at unity', async () => {
-    const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
-    // Guest on channel 0; channel 1 at half, channel 2 at zero, channel 3 above unity.
-    expect(JSON.parse(fastRoutingMatrix(4, [0], new Set(), new Map([[1, 0.5], [2, 0], [3, 1.8]])))).toEqual({
-      i1c0: { o0c0: 0.5 }, i1c1: { o0c1: 0.5 },
-      i3c0: ['o0c0'], i3c1: ['o0c1'],
+      i2c0: ['o0c0'], i2c1: ['o0c1'],
     });
   });
 });
