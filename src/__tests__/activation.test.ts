@@ -429,10 +429,10 @@ describe('activation — fast return feeds (returnFeed.lowLatency)', () => {
   });
 
   it('puts a mute or fader move made while the flow was starting into the new router', async () => {
-    const { recordFastFeedChanges, clearFastFeedState } = await import('../services/fast-feed-state.js');
+    const { beginFastFeedWrite, clearFastFeedState } = await import('../services/fast-feed-state.js');
     const { fastRoutingMatrix } = await import('../lib/fast-returns.js');
     mockStromUpdateBlockProperties.mockClear();
-    recordFastFeedChanges('prod-test-1', [{ channel: 0, toMain: false }, { channel: 2, gain: 0.5 }]);
+    beginFastFeedWrite('prod-test-1', [{ channel: 0, toMain: false }, { channel: 2, gain: 0.5 }]);
     try {
       const router = { flowId: 'flow-conv', blockId: 'b-fast-router-x', numInputs: 3, ownChannels: [1] };
       await activate(makeProductionDoc(), {
@@ -449,14 +449,14 @@ describe('activation — fast return feeds (returnFeed.lowLatency)', () => {
   });
 
   it('drops changes made during a start that failed, so the next run\'s router is left alone', async () => {
-    const { recordFastFeedChanges, clearFastFeedState } = await import('../services/fast-feed-state.js');
+    const { beginFastFeedWrite, clearFastFeedState } = await import('../services/fast-feed-state.js');
     let currentDoc: Record<string, unknown> = makeProductionDoc();
     mockGet.mockImplementation(async () => ({ ...currentDoc }));
     mockInsert.mockImplementation(async (d: Record<string, unknown>) => {
       currentDoc = { ...d };
       return { rev: `rev-${Date.now()}`, ok: true, id: d._id as string };
     });
-    recordFastFeedChanges('prod-test-1', [{ channel: 0, toMain: false }]);
+    beginFastFeedWrite('prod-test-1', [{ channel: 0, toMain: false }]);
     try {
       mockActivateStromFlow.mockRejectedValueOnce(new Error('flow refused'));
       const app = await buildServer();

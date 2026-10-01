@@ -5,7 +5,7 @@ import { loadAudioChannels } from '../lib/audio-channels.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
-import { recordFastFeedChanges, syncFastFeedRouter } from '../services/fast-feed-state.js';
+import { beginFastFeedWrite, syncFastFeedRouter } from '../services/fast-feed-state.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
@@ -163,26 +163,17 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
         const elemId = isMain ? `${mixerBlock2.id}:main_volume` : `${mixerBlock2.id}:volume_${(ch as number) - 1}`;
         const property = body.property === 'volume' ? 'volume' : 'mute';
         const fast = ch !== null
-          ? recordFastFeedChanges(req.params.id, [
-            property === 'mute' ? { channel: ch - 1, muted: body.value === true } : { channel: ch - 1, gain: Number(body.value) },
+          ? beginFastFeedWrite(req.params.id, [
+            // Strom reads a numeric mute through its text form, so 1 mutes as true does.
+            property === 'mute' ? { channel: ch - 1, muted: body.value === true || body.value === 1 } : { channel: ch - 1, gain: Number(body.value) },
           ])
           : undefined;
-        try {
-          await withTimeout(
-            strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value }),
-            5000,
-          );
-        } catch (err) {
-          // A timed-out write may still have been applied; undo keeps the fast feeds with it.
-          if (fast?.undo(err)) {
-            void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
-          }
-          throw err;
-        }
-        if (fast) {
-          fast.settle();
-          void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
-        }
+        const update = strom.properties.updateElement(doc.stromFlowId, elemId, { property_name: property, value: body.value });
+        // A write that timed out may still be applied, so the fast feeds wait for its real answer.
+        const answered = () => fast?.done();
+        void update.then(answered, answered);
+        await withTimeout(update, 5000);
+        if (fast) void syncFastFeedRouter(req.params.id, doc.fastFeedRouter, strom);
         return reply.send({ element_id: req.params.elementId, properties: { [body.property]: body.value } });
       } catch (err) {
         const e = err as { statusCode?: number };

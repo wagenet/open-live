@@ -52,6 +52,18 @@ const ROUTER_PATH = `/api/flows/${CONV_FLOW_ID}/blocks/${ROUTER_ID}/properties`;
 
 const patches: Array<{ path: string; body: Record<string, unknown> }> = [];
 let routerFails = false;
+/** The mixer's channel properties, as accepted writes leave them; a read returns them. */
+let mixer: Record<string, unknown> = {};
+/** The matrix the router last accepted (it starts with every channel open). */
+let routerHeld: string | undefined;
+function openMixer(): Record<string, unknown> {
+  const props: Record<string, unknown> = {};
+  for (let ch = 1; ch <= 3; ch++) Object.assign(props, { [`ch${ch}_to_main`]: true, [`ch${ch}_mute`]: false, [`ch${ch}_fader`]: 1 });
+  return props;
+}
+function applyToMixer(props: Record<string, unknown> | undefined): void {
+  for (const [k, v] of Object.entries(props ?? {})) if (/^ch\d+_(to_main|mute|fader)$/.test(k)) mixer[k] = v;
+}
 let mixerFails = false;
 /** Answer the next mixer write this late (ms); Strom applies it on arrival either way. */
 let slowNextMixerReplyMs = 0;
@@ -73,13 +85,20 @@ const stromServer: Server = createServer((req, res) => {
   req.on('end', () => {
     const raw = Buffer.concat(chunks).toString('utf8');
     const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    if (req.method === 'GET' && req.url === MIXER_PATH) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ properties: mixer }));
+      return;
+    }
     if (req.method === 'PATCH') patches.push({ path: req.url ?? '', body });
+    const props = body['properties'] as Record<string, unknown> | undefined;
     if ((routerFails && req.url === ROUTER_PATH) || (mixerFails && req.url === MIXER_PATH)) {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'block gone' }));
       return;
     }
     if (req.url === MIXER_PATH && loseMixerReply?.match(body['properties'] as Record<string, unknown>)) {
+      applyToMixer(props);
       if (loseMixerReply.as === 'reset') {
         req.socket.destroy();
       } else {
@@ -104,6 +123,8 @@ const stromServer: Server = createServer((req, res) => {
       }, refuseMixerWrites.ms);
       return;
     }
+    if (req.url === MIXER_PATH) applyToMixer(props);
+    if (req.url === ROUTER_PATH) routerHeld = String(props?.['routing_matrix']);
     let delay = 0;
     if (req.url === MIXER_PATH) { delay = slowNextMixerReplyMs; slowNextMixerReplyMs = 0; }
     if (req.url === MIXER_PATH && slowMixerWrite?.match(body['properties'] as Record<string, unknown>)) {
@@ -175,6 +196,12 @@ const send = async (msg: Record<string, unknown>) => {
   await handleMessage(PROD, ws, JSON.stringify(msg), ctx);
   await whenFastFeedRouterIdle(PROD);
 };
+/** What the router holds once the mixer has been read after the last answer. */
+const routerSettled = async (): Promise<string> => {
+  await new Promise((r) => setTimeout(r, 400));
+  await whenFastFeedRouterIdle(PROD);
+  return routerHeld ?? fastRoutingMatrix(3, [1]);
+};
 const routerMatrices = () =>
   patches.filter((p) => p.path === ROUTER_PATH).map((p) => (p.body['properties'] as Record<string, unknown>)['routing_matrix']);
 
@@ -188,6 +215,8 @@ beforeEach(() => {
   failNextMixerAfterMs = null;
   refuseMixerWrites = null;
   loseMixerReply = null;
+  mixer = openMixer();
+  routerHeld = undefined;
   slowNextRouterReplyMs = 0;
   maxRouterInFlight = 0;
   mockBroadcast.mockReset();
@@ -272,13 +301,8 @@ describe('crew mutes reach the fast return feeds', () => {
     mixerFails = true;
     await send({ type: 'CUT', mixerInput: 'video_in_3' });
     await vi.waitFor(() => expect(patches.some((p) => p.path === MIXER_PATH)).toBe(true));
-    await new Promise((r) => setTimeout(r, 50));
-    expect(routerMatrices()).toEqual([]);
-
-    // The next change carries program's state, not the refused cut.
-    mixerFails = false;
-    await send({ type: 'AUDIO_SET', elementId: 'ch2', property: 'mute', value: false });
-    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]))]);
+    // Program still has ch3 off and ch1 on.
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1], new Set([2])));
   });
 
   it('an AFV_SET the mixer refused leaves the fast feeds alone', async () => {
@@ -286,27 +310,22 @@ describe('crew mutes reach the fast return feeds', () => {
     mixerFails = true;
     await send({ type: 'AFV_SET', mixerInput: 'video_in_3', enabled: true });
     expect(routerMatrices()).toEqual([]);
-    mixerFails = false;
-    await send({ type: 'AUDIO_SET', elementId: 'ch2', property: 'mute', value: false });
-    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1])]);
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1]));
   });
 
   it('a mute the mixer refused leaves the fast feeds alone', async () => {
     mixerFails = true;
     await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     expect(routerMatrices()).toEqual([]);
-    mixerFails = false;
-    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
-    expect(routerMatrices()).toEqual([fastRoutingMatrix(3, [1], new Set([2]))]);
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1]));
   });
 
-  it('undoing a refused mute leaves a newer change to that channel in place', async () => {
+  it('keeps a mute when an earlier mute of that channel is refused', async () => {
     failNextMixerAfterMs = 150;
     const refused = send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
     await refused;
-    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
-    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1], new Set([0])));
   });
 
   it('a mute and a quick unmute of one channel, both refused, leave it where program is', async () => {
@@ -315,9 +334,7 @@ describe('crew mutes reach the fast return feeds', () => {
       send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true }),
       send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false }),
     ]);
-    refuseMixerWrites = null;
-    await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
-    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1]));
   });
 
   it('takes a refused mute back out of the router when another channel\'s write carried it', async () => {
@@ -326,7 +343,7 @@ describe('crew mutes reach the fast return feeds', () => {
     await send({ type: 'AUDIO_SET', elementId: 'ch3', property: 'mute', value: true });
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
     await refused;
-    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1], new Set([2])));
   });
 
   it('opens the router again when a mute and an unmute are both refused after another channel\'s write carried the mute', async () => {
@@ -337,16 +354,16 @@ describe('crew mutes reach the fast return feeds', () => {
     expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0, 2])));
     const unmute = send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: false });
     await Promise.all([mute, unmute]);
-    await whenFastFeedRouterIdle(PROD);
     // Program has ch1 open (both refused) and ch3 closed.
-    expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([2])));
+    expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1], new Set([2])));
   });
 
   for (const lost of ['reset', '504'] as const) {
     it(`keeps a mute in the fast feeds when the mixer's reply is lost (${lost})`, async () => {
       loseMixerReply = { match: (props) => props['ch1_to_main'] === false, as: lost };
       await send({ type: 'AUDIO_SET', elementId: 'ch1', property: 'mute', value: true });
-      expect(routerMatrices().at(-1)).toBe(fastRoutingMatrix(3, [1], new Set([0])));
+      // Strom applied it, so the read that follows finds it.
+      expect(await routerSettled()).toBe(fastRoutingMatrix(3, [1], new Set([0])));
     });
   }
 
