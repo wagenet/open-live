@@ -126,10 +126,10 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
  * Per-socket `startMeterRelay` calls there would either miss re-creating a
  * force-stopped relay (losing meters for an operator that stayed open) or
  * double-count the mid-teardown socket (an orphaned ref that never reaches
- * zero). Since every operator socket backs exactly one ref (connect takes one,
- * close releases one), this rebinds any existing relay onto the new flow and
- * sets its refCount to the operator-socket count so the later per-socket stops
- * land it back on zero. No-op when `holderCount <= 0`.
+ * zero). Since every controller socket, watch-only included, backs exactly one
+ * ref (connect takes one, close releases one), this rebinds any existing relay
+ * onto the new flow and sets its refCount to the socket count so the later
+ * per-socket stops land it back on zero. No-op when `holderCount <= 0`.
  */
 export function reconcileMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId: string | null | undefined, holderCount: number): void {
   if (holderCount <= 0) return;
