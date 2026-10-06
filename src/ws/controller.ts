@@ -935,14 +935,15 @@ function broadcastAudioReset(productionId: string, numChannels: number, muted: S
 }
 
 /**
- * The flow whose meter/clip relay each socket holds one ref on (watch-only
- * sockets hold meter refs only). A
- * socket releases on close only what it holds, and reinit takes refs on behalf
- * of sockets that stayed open across a reactivation.
+ * The relay refs each socket holds: `meter` is the meter relay's generation,
+ * `clip` the flow of the clip relay (watch-only sockets hold meter refs only).
+ * A socket releases on close only what it holds, and reinit takes refs on
+ * behalf of sockets that stayed open across a reactivation.
  */
-const relayHolds = new WeakMap<WebSocket, { meter?: string; clip?: string }>();
+type RelayHold = { meter?: number; clip?: string };
+const relayHolds = new WeakMap<WebSocket, RelayHold>();
 
-function relayHold(ws: WebSocket): { meter?: string; clip?: string } {
+function relayHold(ws: WebSocket): RelayHold {
   let hold = relayHolds.get(ws);
   if (!hold) {
     hold = {};
@@ -1061,8 +1062,8 @@ export async function reinitConnectedControllers(productionId: string): Promise<
       // #434). Every socket then releases exactly one ref on close, landing the
       // relay back at zero.
       const meterSockets = getSockets(productionId);
-      reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterSockets.length);
-      for (const ws of meterSockets) relayHold(ws).meter = flowId;
+      const meterGeneration = reconcileMeterRelay(productionId, flowId, audioBlockId, doc.loudnessMainBlockId, meterSockets.length);
+      for (const ws of meterSockets) relayHold(ws).meter = meterGeneration;
     }
   } catch (err) {
     console.warn('[controller] reinit audio/meter error:', err);
@@ -3216,7 +3217,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         unsubscribe(id, socket);
         // Relays are ref-counted, so only release what this socket holds.
         const hold = relayHolds.get(socket);
-        if (hold?.meter) stopMeterRelay(id);
+        // A meter hold on a relay that was force-stopped since releases nothing.
+        if (hold?.meter !== undefined) stopMeterRelay(id, hold.meter);
         if (hold?.clip) stopClipRelay(id);
         // Audio state registries are kept in memory so other connected clients
         // and future reconnects inherit the current AFV/mute configuration.
@@ -3611,8 +3613,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             // nothing. A socket that closed during the connect sync must not take
             // a ref it never releases.
             if (!socketClosed) {
-              startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
-              relayHold(socket).meter = connectDoc.stromFlowId;
+              relayHold(socket).meter = startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
             }
           }
         } catch (err) {

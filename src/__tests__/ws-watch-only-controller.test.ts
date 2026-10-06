@@ -68,10 +68,10 @@ const relayRefs = (id: string) => {
   return relayRefCounts.get(id)!;
 };
 vi.mock('../services/meter-relay.js', () => ({
-  startMeterRelay: (id: string) => { relayRefs(id).meter++; },
+  startMeterRelay: (id: string) => { relayRefs(id).meter++; return 1; },
   stopMeterRelay: (id: string) => { if (relayRefs(id).meter > 0) relayRefs(id).meter--; },
   forceStopMeterRelay: (id: string) => { relayRefs(id).meter = 0; },
-  reconcileMeterRelay: (id: string, _flow: string, _block: string, _loud: unknown, count: number) => { if (count > 0) relayRefs(id).meter = count; },
+  reconcileMeterRelay: (id: string, _flow: string, _block: string, _loud: unknown, count: number) => { if (count <= 0) return undefined; relayRefs(id).meter = count; return 1; },
 }));
 vi.mock('../services/clip-relay.js', () => ({
   startClipRelay: (id: string) => { relayRefs(id).clip++; },
