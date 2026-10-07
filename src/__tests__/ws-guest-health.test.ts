@@ -54,7 +54,8 @@ const GUEST1_BLOCK = `b-input-15-${SUFFIX}`;
 const GUEST2_BLOCK = `b-input-14-${SUFFIX}`;
 const CAMERA_BLOCK = `b-input-0-${SUFFIX}`;
 
-let blockHealth: Array<Record<string, unknown>> = [];
+// Normally an array of entries; a test sets a malformed value to check it is skipped.
+let blockHealth: unknown = [];
 
 const stromServer: Server = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -70,7 +71,7 @@ const stromServer: Server = createServer((req, res) => {
         flow: {
           id: flowMatch[1],
           blocks: [{ id: AUDIO_BLOCK, block_definition_id: 'builtin.mixer', properties: { num_channels: 3 } }],
-          ...(blockHealth.length > 0 ? { block_health: blockHealth } : {}),
+          ...(!Array.isArray(blockHealth) || blockHealth.length > 0 ? { block_health: blockHealth } : {}),
         },
       }));
       return;
@@ -228,6 +229,19 @@ describe('GUEST_HEALTH connect snapshot', () => {
     expect(health.map((m) => [m['mixerInput'], m['status']]).sort()).toEqual([['video_in_14', 'ok'], ['video_in_15', 'ok']]);
     await s.close();
   });
+
+  for (const [label, value] of [['a null entry', [null]], ['an object, not an array', { foo: 1 }]] as const) {
+    it(`still starts the meter relay when block_health is ${label}`, async () => {
+      blockHealth = value;
+      await startServer();
+      const s = await openSocket();
+      await s.waitFor(isSnapshotEnd);
+      expect(s.messages.filter(isHealth).map((m) => [m['mixerInput'], m['status']]).sort())
+        .toEqual([['video_in_14', 'ok'], ['video_in_15', 'ok']]);
+      await waitUntil(() => stromEvents.clients.size >= 1);
+      await s.close();
+    });
+  }
 });
 
 describe('GUEST_HEALTH live relay', () => {
@@ -254,6 +268,24 @@ describe('GUEST_HEALTH live relay', () => {
     expect(ok).not.toHaveProperty('detail');
 
     expect(s.messages.filter(isHealth)).toHaveLength(2);
+    await s.close();
+  });
+
+  it('drops a status other than ok or failed instead of clearing a failure', async () => {
+    await startServer();
+    const s = await openSocket();
+    await s.waitFor(isSnapshotEnd);
+    await waitForRelay(s);
+    s.messages.length = 0;
+
+    emitHealth({ flow_id: FLOW, block_id: GUEST1_BLOCK, status: 'failed', detail: 'x' });
+    await s.waitFor((m) => isHealth(m) && m['status'] === 'failed');
+    emitHealth({ flow_id: FLOW, block_id: GUEST1_BLOCK, status: 'degraded', detail: 'y' });
+    // A later event on another seat marks that the degraded one has been handled.
+    emitHealth({ flow_id: FLOW, block_id: GUEST2_BLOCK, status: 'failed', detail: 'z' });
+    await s.waitFor((m) => isHealth(m) && m['mixerInput'] === 'video_in_14');
+
+    expect(s.messages.filter(isHealth).map((m) => [m['mixerInput'], m['status']])).toEqual([['video_in_15', 'failed'], ['video_in_14', 'failed']]);
     await s.close();
   });
 

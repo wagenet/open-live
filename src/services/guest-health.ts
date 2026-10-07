@@ -50,7 +50,9 @@ export function guestInputBlocks(doc: Pick<ProductionDoc, '_id' | 'sources'>): M
 
 /**
  * Builds the `GUEST_HEALTH` message for one Strom health report, or `null` when
- * the block is not one of this production's guest inputs.
+ * the block is not one of this production's guest inputs or the status is
+ * neither `ok` nor `failed` (a status from a newer Strom must not clear a
+ * failure).
  */
 export function guestHealthMessage(
   guestBlocks: ReadonlyMap<string, string>,
@@ -58,7 +60,8 @@ export function guestHealthMessage(
 ): GuestHealthMessage | null {
   const mixerInput = guestBlocks.get(report.block_id);
   if (!mixerInput) return null;
-  const status = report.status === 'failed' ? 'failed' : 'ok';
+  const status = report.status;
+  if (status !== 'ok' && status !== 'failed') return null;
   const causes = report.causes;
   return {
     type: 'GUEST_HEALTH',
@@ -75,13 +78,18 @@ export function guestHealthMessage(
  * A seat Strom does not list is reported `ok`: Strom lists only blocks it has
  * scanned, and clears the list when the pipeline stops, so an absent entry
  * means no known failure. Sending every seat lets a reconnecting studio drop a
- * failure that ended while it was away.
+ * failure that ended while it was away. A malformed `block_health` (not an
+ * array, or entries that are not objects) is skipped rather than thrown on,
+ * since callers send this alongside the meter and audio init.
  */
 export function guestHealthSnapshot(
   guestBlocks: ReadonlyMap<string, string>,
-  blockHealth: readonly BlockHealthReport[] | undefined,
+  blockHealth: unknown,
 ): GuestHealthMessage[] {
-  const byBlock = new Map((blockHealth ?? []).map((h) => [h.block_id, h]));
+  const byBlock = new Map<string, BlockHealthReport>();
+  for (const h of Array.isArray(blockHealth) ? blockHealth : []) {
+    if (h !== null && typeof h === 'object' && typeof h.block_id === 'string') byBlock.set(h.block_id, h);
+  }
   const messages: GuestHealthMessage[] = [];
   for (const blockId of guestBlocks.keys()) {
     const report = byBlock.get(blockId) ?? { block_id: blockId, status: 'ok' as const };
