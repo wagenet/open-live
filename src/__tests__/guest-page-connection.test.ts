@@ -152,7 +152,7 @@ function runPage(script: string) {
     requests.push({ method, url });
     if (url.endsWith('/slot')) return respond(200, { returnOnly: false });
     if (url.endsWith('/join')) {
-      return respond(200, { whipUrl: 'https://live.example.com/whip', feeds: [{ url: 'https://live.example.com/whep' }] });
+      return respond(200, { whipUrl: 'https://live.example.com/whip', feeds: [{ id: 'picture', url: 'https://live.example.com/whep' }] });
     }
     return respond(201, {}, '/whip/s1');
   };
