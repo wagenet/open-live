@@ -257,6 +257,21 @@ describe('idle-watchdog auto-deactivate — active → ended (spec §1)', () => 
     expect(inserted.autoDeactivated).toBe(true);
   });
 
+  it('clears the recorder fields, so a later activation cannot act on the old recorder', async () => {
+    const doc = makeProductionDoc({
+      status: 'active', stromFlowId: 'flow-abc', recorderBlockId: 'b-rec', recorderOutputDir: 'recordings/prod-test-1/x',
+    });
+    mockGet.mockResolvedValue(doc);
+    mockDeactivateStromFlow.mockResolvedValue(undefined);
+    mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
+
+    await deactivateProduction('prod-test-1', silentLog);
+
+    const inserted = mockInsert.mock.calls[0][0];
+    expect(inserted.recorderBlockId).toBeUndefined();
+    expect(inserted.recorderOutputDir).toBeUndefined();
+  });
+
   it('revokes guest invites and ends live guest sessions when the production ends (issue #414)', async () => {
     const doc = makeProductionDoc({ status: 'active', stromFlowId: 'flow-abc' });
     mockGet.mockResolvedValue(doc);

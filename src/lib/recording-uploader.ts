@@ -33,6 +33,7 @@
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { config } from '../config.js';
 import { StromClientError, type MediaEntry, type StromClient } from './strom.js';
+import { INPUT_RECORDING_DIR_RE, inputRecordingFilePrefix, type InputTrack } from './input-recording.js';
 
 export interface MinioTarget {
   endpoint: string; // host[:port], no scheme
@@ -63,6 +64,10 @@ export interface UploadedSegment {
    * carries none.
    */
   startedAt?: string;
+  /** The input it records, for a per-input recording; absent for the program. */
+  mixerInput?: string;
+  /** Which of that input's tracks the file holds. */
+  track?: InputTrack;
 }
 
 export interface UploadResult {
@@ -366,6 +371,9 @@ function activationStartFromDirName(name: string): string | undefined {
   return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z`;
 }
 
+/** The per-activation sidecar services/recording-index.ts writes beside the recordings. */
+export const RECORDING_INDEX_FILE = 'recordings.json';
+
 function keyPrefix(): string {
   return config.recordingKeyPrefix
     ? `${config.recordingKeyPrefix.replace(/\/+$/, '')}/`
@@ -396,6 +404,11 @@ export function recordingStartFromFileName(name: string): string | undefined {
   if (date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d || date.getUTCHours() !== h
     || date.getUTCMinutes() !== mi || date.getUTCSeconds() !== sec) return undefined;
   return date.toISOString();
+}
+
+/** Object key of an activation's sidecar. */
+export function recordingIndexObjectKey(productionId: string, activationDirName: string): string {
+  return `${keyPrefix()}${productionId}/${activationDirName}/${RECORDING_INDEX_FILE}`;
 }
 
 export interface UploadRecordingsArgs {
@@ -459,6 +472,10 @@ export interface UploadProductionRecordingsArgs extends Omit<UploadRecordingsArg
  * whose upload failed at its own deactivate is picked up by a later one.
  * A production that never recorded (no directory on Strom) uploads nothing.
  *
+ * Inside an activation's directory, files are the program recording,
+ * `video_in_N/` subdirectories hold per-input recordings, and the sidecar is
+ * copied to recordingIndexObjectKey() without being returned as a recording.
+ *
  * Then deletes from Strom every swept file that is in object storage,
  * including ones skipped as already uploaded, and removes each directory
  * that leaves empty (issue #366).
@@ -477,15 +494,40 @@ export async function uploadProductionRecordings(args: UploadProductionRecording
 
   const swept: SweptDir[] = [];
   for (const dir of entries.filter((e) => e.is_directory)) {
-    let files: MediaEntry[];
+    let listed: MediaEntry[];
     try {
-      files = ((await strom.media.list(dir.path)).entries ?? []).filter((e) => !e.is_directory);
+      listed = (await strom.media.list(dir.path)).entries ?? [];
     } catch (err) {
       result.failed.push({ file: dir.path, error: err instanceof Error ? err.message : String(err) });
       continue;
     }
-    const done = await uploadFiles(args, files, activationStartFromDirName(dir.name), isUploaded, result);
-    swept.push({ path: dir.path, fileCount: files.length, done });
+    const startedAt = activationStartFromDirName(dir.name);
+    // Subdirectories first, so the activation's own directory is only removed
+    // once they have been.
+    for (const sub of listed.filter((e) => e.is_directory && INPUT_RECORDING_DIR_RE.test(e.name))) {
+      let files: MediaEntry[];
+      try {
+        files = ((await strom.media.list(sub.path)).entries ?? []).filter((e) => !e.is_directory);
+      } catch (err) {
+        result.failed.push({ file: sub.path, error: err instanceof Error ? err.message : String(err) });
+        continue;
+      }
+      const done = await uploadFiles(args, files, startedAt, isUploaded, result, sub.name);
+      swept.push({ path: sub.path, fileCount: files.length, done });
+    }
+    const files = listed.filter((e) => !e.is_directory && e.name !== RECORDING_INDEX_FILE);
+    const done = await uploadFiles(args, files, startedAt, isUploaded, result);
+    const index = listed.find((e) => !e.is_directory && e.name === RECORDING_INDEX_FILE);
+    if (index) {
+      try {
+        const bytes = await downloadFromStrom(args.stromUrl, args.stromToken, index.path);
+        await putObject(args.target, recordingIndexObjectKey(productionId, dir.name), bytes, 'application/json');
+        done.push(index.path);
+      } catch (err) {
+        result.failed.push({ file: index.path, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    swept.push({ path: dir.path, fileCount: files.length + (index ? 1 : 0), done });
   }
   if (includeSharedDir) {
     // Listed last so its directory, the production's, is only removed once
@@ -508,6 +550,7 @@ async function uploadFiles(
   activationStartedAt: string | undefined,
   isUploaded: (key: string) => Promise<boolean>,
   result: UploadResult,
+  mixerInput?: string,
 ): Promise<string[]> {
   const { stromUrl, stromToken, productionId, target } = args;
   const done: string[] = [];
@@ -528,6 +571,8 @@ async function uploadFiles(
         ...(startedAt ? { startedAt } : {}),
         ...(activationStartedAt ? { activationStartedAt } : {}),
         ...(entry.modified ? { modifiedAt: new Date(entry.modified * 1000).toISOString() } : {}),
+        ...(mixerInput ? { mixerInput } : {}),
+        ...(mixerInput ? trackOf(productionId, mixerInput, entry.name) : {}),
       });
       done.push(entry.path);
     } catch (err) {
@@ -547,6 +592,11 @@ async function uploadFiles(
     }
   }
   return done;
+}
+
+function trackOf(productionId: string, mixerInput: string, fileName: string): { track?: InputTrack } {
+  const track = (['video', 'audio'] as const).find((t) => fileName.startsWith(`${inputRecordingFilePrefix(productionId, mixerInput, t)}_`));
+  return track ? { track } : {};
 }
 
 interface SweptDir {

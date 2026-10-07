@@ -16,6 +16,7 @@ import { forceStopClipRelay } from '../services/clip-relay.js';
 import { config, isObjectStorageConfigured } from '../config.js';
 import { minioTargetFromConfig, uploadProductionRecordings } from '../lib/recording-uploader.js';
 import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
+import { bindRecordingIndex, closeRecordingIndex, currentRecordingIndex, openRecordingIndex, waitForNextFiles, type RecordingIndexHandle } from '../services/recording-index.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 
@@ -26,6 +27,9 @@ import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type O
 const FLOW_POLL_INTERVAL_MS = 500;
 const FLOW_POLL_TIMEOUT_MS = 30_000;
 const MAX_DB_WRITE_RETRIES = 3;
+// How long deactivate waits for a split to open each recorder's next file.
+// A split lands on the next keyframe; a passthrough input keeps its sender's GOP.
+const SPLIT_TIMEOUT_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // AbortController map — keyed by production ID, allows deactivate to cancel
@@ -191,6 +195,7 @@ function deactivatedDoc(
     loudnessMainBlockId: undefined,
     recorderBlockId: undefined,
     recorderOutputDir: undefined,
+    inputRecorderBlockIds: undefined,
     sourceOffsetBlockIds: undefined,
     sourceAudioOffsetBlockIds: undefined,
     clipPlayerBlockIds: undefined,
@@ -356,6 +361,8 @@ async function runActivationFlow(
   let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
+  let recordingIndex: RecordingIndexHandle | undefined;
+  let activationSucceeded = false;
 
   // Force-stop the meter and clip relays bound to this run's (dying) flow,
   // mirroring deactivate (issue #435). A controller connecting while status is
@@ -394,8 +401,13 @@ async function runActivationFlow(
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-    // Step 1: Start the Strom flow
+    // Step 1: Start the Strom flow. The recording index listens first, so it
+    // sees a recorder open its first file even if that happens at once.
     if (signal.aborted) return;
+    if (doc.sources.some((s) => (s.record ?? 'off') !== 'off') || outputDocs.some((o) => o.outputType === 'recording')) {
+      recordingIndex = await openRecordingIndex(productionId);
+    }
+    const activatedAtMs = Date.now();
     const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined);
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
@@ -421,6 +433,9 @@ async function runActivationFlow(
       // recorder fields a previous activation left behind.
       recorderBlockId: activation.recorderBlockId,
       recorderOutputDir: activation.recorderOutputDir,
+      inputRecorderBlockIds: activation.inputRecorders.length > 0
+        ? Object.fromEntries(activation.inputRecorders.map((r) => [r.mixerInput, r.blockIds]))
+        : undefined,
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
       ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
       ...(Object.keys(activation.clipPlayerBlockIds).length > 0 && { clipPlayerBlockIds: activation.clipPlayerBlockIds }),
@@ -429,6 +444,21 @@ async function runActivationFlow(
       ...(activation.warnings.length > 0 && { activationWarnings: activation.warnings }),
     });
     for (const w of activation.warnings) log.warn({ productionId, warning: w.type }, w.message);
+    if (recordingIndex && activation.recordingsDir) {
+      bindRecordingIndex(recordingIndex, {
+        productionId,
+        productionName: doc.name,
+        flowId: stromFlowId,
+        dir: activation.recordingsDir,
+        activatedAtMs,
+        program: activation.recorderBlockId && activation.recorderOutputDir
+          ? { recorderBlockId: activation.recorderBlockId, outputDir: activation.recorderOutputDir }
+          : null,
+        inputs: activation.inputRecorders,
+      });
+    } else if (recordingIndex) {
+      await closeRecordingIndex(recordingIndex);
+    }
 
     // Step 3: Poll until flow reaches 'playing' or we time out
     const deadline = Date.now() + FLOW_POLL_TIMEOUT_MS;
@@ -602,6 +632,7 @@ async function runActivationFlow(
           for (const w of activation.warnings) broadcast(productionId, { type: 'ERROR', error: w.message });
         }
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
+        activationSucceeded = true;
 
         // Controllers that stayed connected across a deactivate→reactivate are
         // never re-run through the WS connect handler, so re-run first-connect
@@ -647,6 +678,7 @@ async function runActivationFlow(
       mixerBlockId: undefined,
       recorderBlockId: undefined,
       recorderOutputDir: undefined,
+      inputRecorderBlockIds: undefined,
       whepEndpoint: undefined,
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
@@ -657,6 +689,8 @@ async function runActivationFlow(
 
     notifyProductionDeactivated(productionId);
   } finally {
+    // Kept open only by an activation that went live; deactivate closes it.
+    if (recordingIndex && (signal.aborted || !activationSucceeded)) await closeRecordingIndex(recordingIndex);
     // Only remove the entry if it still points to *this* run's controller.
     // A slow aborted run can otherwise finish after a newer activation has
     // registered its own controller and delete that entry, leaving the newer
@@ -756,10 +790,18 @@ const ReturnFeedInput = z
   })
   .optional();
 
+// Passthrough recording (encoded streams into the recorder, no transcode) is
+// not built yet; it is refused here rather than saved and skipped at activation.
+const RecordModeInput = z
+  .enum(['off', 'transcode', 'passthrough'])
+  .refine((mode) => mode !== 'passthrough', { message: "record: 'passthrough' is not supported yet; use 'transcode'" })
+  .optional();
+
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1).max(128),
   mixerInput: mixerInputSchema,
   returnFeed: ReturnFeedInput,
+  record: RecordModeInput,
 });
 
 const GraphicAssignmentInput = z.object({
@@ -1028,6 +1070,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       activationAbortControllers.delete(doc._id);
     }
 
+    // This activation's index. Closed by handle, since a reactivation during
+    // the upload below opens the production's next one.
+    const recordingIndex = currentRecordingIndex(doc._id);
     clearProductionPflState(doc._id);
     clearAudioState(doc._id);
     clearPipState(doc._id);
@@ -1050,8 +1095,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
       // VOD recording (issue #41): when object storage is configured, finalise
-      // the current segment (recorder.splitNow) then upload Strom's local
-      // recordings to MinIO — Strom's recorder has no native S3 sink, so
+      // the current segment (recorder.splitNow), stop the flow, then upload
+      // Strom's local recordings to MinIO — Strom's recorder has no native S3 sink, so
       // open-live pulls the segments and pushes them to object storage.
       // Every activation's directory is swept, skipping objects already
       // registered, so a session whose upload failed (or that ended without
@@ -1059,7 +1104,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // Without object storage the recordings stay on Strom's media path and
       // teardown proceeds immediately.
       // Best-effort: a failed upload must not block deactivation/teardown.
-      if (doc.recorderBlockId || isObjectStorageConfigured()) {
+      const inputRecorderBlockIds = Object.values(doc.inputRecorderBlockIds ?? {}).flatMap((ids) => Object.values(ids));
+      if (doc.recorderBlockId || inputRecorderBlockIds.length > 0 || isObjectStorageConfigured()) {
         const target = minioTargetFromConfig();
         if (!target) {
           log.info(
@@ -1068,9 +1114,25 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
           );
         } else {
           try {
-            if (doc.recorderBlockId) {
-              await strom.recorder.splitNow(doc.stromFlowId, doc.recorderBlockId).catch(() => undefined);
+            const flowId = doc.stromFlowId;
+            const recorderIds = [doc.recorderBlockId, ...inputRecorderBlockIds].filter((id): id is string => !!id);
+            // A split lands on the recorder's next keyframe, after splitNow
+            // returns. Stopping before then would leave the file it closes
+            // unfinalised: Strom's stop does not end the recording, so the
+            // file keeps its last periodic moov and loses up to ~2 s.
+            const split = recordingIndex && waitForNextFiles(recordingIndex, recorderIds, SPLIT_TIMEOUT_MS);
+            await Promise.all(recorderIds.map((id) => strom.recorder.splitNow(flowId, id).catch(() => undefined)));
+            await split;
+            // Stop at once, so the files the split opened hold milliseconds,
+            // not however long the upload takes.
+            try {
+              await strom.flows.stop(flowId);
+            } catch {
+              // deactivateStromFlow below stops it again
             }
+            // Final sidecar write, listing the files the split opened, before
+            // the sweep below uploads it.
+            if (recordingIndex) await closeRecordingIndex(recordingIndex);
             const uploadRes = await uploadProductionRecordings({
               strom,
               stromUrl: config.stromUrl,
@@ -1113,7 +1175,9 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
                   _id: recordingDocId(target.bucket, seg.key),
                   type: 'recording',
                   productionId: doc._id,
-                  ...(recordingOutputId ? { outputId: recordingOutputId } : {}),
+                  ...(seg.mixerInput
+                    ? { mixerInput: seg.mixerInput, ...(seg.track && { track: seg.track }) }
+                    : recordingOutputId ? { outputId: recordingOutputId } : {}),
                   bucket: target.bucket,
                   key: seg.key,
                   sizeBytes: seg.sizeBytes,
@@ -1158,6 +1222,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
       await deactivateStromFlow(doc.stromFlowId, strom);
     }
+    // Without object storage, the sidecar's final write; otherwise a no-op.
+    if (recordingIndex) await closeRecordingIndex(recordingIndex);
 
     // Tear down the Open Intercom talkback grouping (all its lines) with the
     // production lifecycle (issue #302). Best-effort: a failed teardown must not
@@ -1193,6 +1259,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       ...(body.returnFeed
         ? { returnFeed: { synced: body.returnFeed.synced, lowLatency: body.returnFeed.lowLatency } }
         : {}),
+      ...(body.record && body.record !== 'off' && { record: body.record }),
     };
     for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {

@@ -28,6 +28,7 @@ function makeStromClient() {
       start: vi.fn().mockResolvedValue({}),
       delete: vi.fn().mockResolvedValue({}),
     },
+    blocks: { list: vi.fn().mockResolvedValue({ blocks: [{ id: 'builtin.audioenc' }] }) },
     capturedFlows,
   };
 }
