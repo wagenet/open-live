@@ -24,6 +24,8 @@ import { resolvePublicBaseUrl, updateProductionDoc } from './productions.js';
 import { applyReturnMode } from '../ws/controller.js';
 import { resolveStromWhipUrl } from './whip.js';
 import { getStromToken } from '../lib/strom-token.js';
+import { getIceServers } from '../lib/ice-servers.js';
+import type { IceServer } from '../lib/strom.js';
 import {
   isIntercomEnabled,
   provisionGuestLine,
@@ -563,10 +565,20 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         ...(returnLive ? [{ id: 'picture', url: `${returnsBase}/picture/whep`, video: true }] : []),
         ...(fastLive ? [{ id: 'fast', url: `${returnsBase}/fast/whep`, video: false }] : []),
       ];
+      // The page's ICE servers: Strom's list, so a guest off the network gets
+      // the deployment's TURN server. Best effort — without it the page keeps
+      // its built-in STUN server.
+      let iceServers: IceServer[] | undefined;
+      try {
+        ({ iceServers } = await getIceServers());
+      } catch (err) {
+        fastify.log.warn({ err }, 'POST guests/:id/join — ICE servers unavailable');
+      }
       return reply.status(200).send({
         guestId: session._id,
         whipUrl,
         feeds,
+        ...(iceServers?.length ? { iceServers } : {}),
         modes: returnModesFor(mixerInput, fastLive),
         defaultMode: 'program-minus',
         returnMode,

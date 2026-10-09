@@ -147,9 +147,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var inviteId = parts[parts.length - 1] || "";
     var token = (location.hash || "").replace(/^#/, "");
     var apiBase = location.origin;
-    // A public STUN server for srflx candidate discovery. TURN, when configured,
-    // is negotiated by the WHIP/WHEP server side; this only helps the browser
-    // find its own reflexive address behind NAT.
+    // The browser's ICE servers. The join response carries the deployment's
+    // (Strom's STROM_SERVER_ICE_SERVERS, TURN included), which a guest off the
+    // network needs to reach Strom; until then, or without them, a public STUN
+    // server for srflx candidate discovery.
     var ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
 
     // ---- Elements ----------------------------------------------------------
@@ -383,6 +384,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function (data) {
         joinData = data;
+        if (data.iceServers && data.iceServers.length) ICE = { iceServers: data.iceServers };
         return whipPublish(data.whipUrl, localStream);
       }).then(function () {
         live = true;
