@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { GuestInviteDoc, GuestSessionDoc, ProductionDoc } from '../db/types.js';
+import type { IceServer } from '../lib/strom.js';
 
 const TEST_API_KEY = 'test-secret-key';
 process.env['API_KEY'] = TEST_API_KEY;
@@ -96,6 +97,13 @@ vi.mock('../ws/controller.js', () => ({
   applyReturnMode: (...args: unknown[]) => applyReturnModeMock(...args),
 }));
 
+// Strom's ICE servers for the join response; unreachable unless a test says so.
+const getIceServersMock = vi.fn();
+vi.mock('../lib/ice-servers.js', () => ({
+  getIceServers: (...args: unknown[]) => getIceServersMock(...args),
+  resetIceServersCache: vi.fn(),
+}));
+
 const AUTH = { authorization: `Bearer ${TEST_API_KEY}` };
 
 let app: FastifyInstance;
@@ -144,6 +152,7 @@ beforeEach(() => {
   sessionsStore.clear();
   productionsStore.clear();
   applyReturnModeMock.mockClear();
+  getIceServersMock.mockReset().mockRejectedValue(new Error('Strom unreachable'));
 });
 
 describe('POST /api/v1/productions/:id/guests/invites', () => {
@@ -246,6 +255,12 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
   }
 
   it('joins with a valid invite token and returns a whipUrl on the existing WHIP contract', async () => {
+    // Strom's shape: `urls` is one string (strom types/src/whep.rs).
+    const iceServers: IceServer[] = [
+      { urls: 'stun:stun.example.com:3478' },
+      { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
+    ];
+    getIceServersMock.mockResolvedValueOnce({ iceServers });
     const invite = await createInvite();
     const res = await app.inject({
       method: 'POST',
@@ -269,6 +284,10 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
     // succeeds and `intercomLine` is absent (spec §Configuration, OQ1).
     expect(body.intercomLine).toBeUndefined();
     expect(sessionsStore.get(body.guestId)?.intercomLineId).toBeUndefined();
+    // The page's ICE servers are Strom's, TURN included, looked up with the
+    // join's deadline.
+    expect(body.iceServers).toEqual(iceServers);
+    expect(getIceServersMock).toHaveBeenCalledWith({ timeoutMs: 3000 });
   });
 
   it('honours a pinned mixerInput from the invite', async () => {
@@ -279,6 +298,9 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
       headers: { authorization: `Bearer ${invite.token}` },
     });
     expect(res.json().whipUrl).toContain('/whip/video_in_3');
+    // Strom is unreachable here (the default mock): the join still succeeds,
+    // without ICE servers, and the page keeps its built-in STUN server.
+    expect(res.json().iceServers).toBeUndefined();
   });
 
   it('does NOT require the shared API key (token-authed route is exempt)', async () => {
