@@ -19,7 +19,10 @@ vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: mockGet, insert: mockInsert, find: mockFind, findTrusted: mockFindTrusted }),
   getOutputsDb: () => ({ get: mockOutputGet, insert: mockOutputInsert, find: mockOutputFind, destroy: vi.fn() }),
   getSourcesDb: () => ({ get: vi.fn(), insert: vi.fn(), find: vi.fn().mockResolvedValue({ docs: [] }), destroy: vi.fn() }),
-  getRecordingsDb: () => ({ insert: mockRecordingInsert }),
+  getRecordingsDb: () => ({
+    insert: mockRecordingInsert,
+    get: vi.fn().mockRejectedValue(Object.assign(new Error('missing'), { statusCode: 404 })),
+  }),
   getGuestInvitesDb: () => ({ find: vi.fn().mockResolvedValue({ docs: [] }), destroy: vi.fn() }),
   getGuestSessionsDb: () => ({ find: vi.fn().mockResolvedValue({ docs: [] }), insert: vi.fn() }),
   connectDb: vi.fn().mockResolvedValue(undefined),
@@ -108,7 +111,7 @@ beforeEach(() => {
   mockDeleteFile.mockResolvedValue({});
   mockDeleteDir.mockResolvedValue({});
   mockMediaList.mockResolvedValue({
-    entries: FILES.map((name) => ({ name, path: `recordings/prod-rec-1/${name}`, is_dir: false })),
+    entries: FILES.map((name) => ({ name, path: `recordings/prod-rec-1/${name}`, is_directory: false })),
   });
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { method?: string }) => {
     if (init?.method === 'PUT') return new Response('', { status: 200 });

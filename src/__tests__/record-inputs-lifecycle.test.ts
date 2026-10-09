@@ -358,7 +358,7 @@ describe('activate — per-input recorders', () => {
     mockActivateStromFlow.mockResolvedValue({
       flowId: 'flow-new', mixerBlockId: null, audioMixerBlockId: null, loudnessMainBlockId: null,
       sourceOffsetBlockIds: {}, sourceAudioOffsetBlockIds: {}, clipPlayerBlockIds: {}, returnBuses: [], returnWhepEntries: [], mixerInputMap: {},
-      warnings: [], recordingsDir: ACT_DIR, inputRecorders,
+      warnings: [], fastWhepEntries: [], recordingsDir: ACT_DIR, inputRecorders,
     });
   });
 
