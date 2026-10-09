@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { GuestInviteDoc, GuestSessionDoc, ProductionDoc } from '../db/types.js';
+import type { IceServer } from '../lib/strom.js';
 
 const TEST_API_KEY = 'test-secret-key';
 process.env['API_KEY'] = TEST_API_KEY;
@@ -254,7 +255,8 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
   }
 
   it('joins with a valid invite token and returns a whipUrl on the existing WHIP contract', async () => {
-    const iceServers = [
+    // Strom's shape: `urls` is one string (strom types/src/whep.rs).
+    const iceServers: IceServer[] = [
       { urls: 'stun:stun.example.com:3478' },
       { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
     ];

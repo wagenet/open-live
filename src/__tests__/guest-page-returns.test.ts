@@ -49,6 +49,7 @@ class FakeElement {
 interface FakePc {
   kinds: string[];
   closed: boolean;
+  config: unknown;
   trackListener?: (e: { streams: unknown[] }) => void;
 }
 
@@ -59,7 +60,15 @@ interface Request {
 
 type Feed = { id: string; url: string; video: boolean };
 
-function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean } = {}) {
+interface PageOpts {
+  failFast?: boolean;
+  /** The join response's iceServers; absent when undefined. */
+  iceServers?: unknown[];
+  /** Each PeerConnection's iceGatheringState; 'complete' skips the gathering wait. */
+  gathering?: string;
+}
+
+function runPage(script: string, feeds: Feed[], opts: PageOpts = {}) {
   const ids = [
     'banner', 'muted-indicator', 'onair-badge', 'preview', 'return', 'return-audio',
     'return-hint', 'cam', 'mic', 'pickers', 'golive', 'mute', 'leave',
@@ -70,12 +79,21 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean } = {
 
   const pcs: FakePc[] = [];
   const requests: Request[] = [];
+  // The page's timer delays; long ones (the ICE gathering cap) fire at once.
+  const delays: number[] = [];
+  const pageSetTimeout = (fn: () => void, ms = 0) => {
+    delays.push(ms);
+    return setTimeout(fn, ms >= 1000 ? 0 : ms);
+  };
 
   class RTCPeerConnection {
-    state: FakePc = { kinds: [], closed: false };
-    iceGatheringState = 'complete';
+    state: FakePc = { kinds: [], closed: false, config: undefined };
+    iceGatheringState = opts.gathering ?? 'complete';
     localDescription = { sdp: 'offer' };
-    constructor() { pcs.push(this.state); }
+    constructor(config: unknown) {
+      this.state.config = config;
+      pcs.push(this.state);
+    }
     addTrack() {}
     addTransceiver(kind: string) { this.state.kinds.push(kind); }
     addEventListener(type: string, fn: (e: { streams: unknown[] }) => void) {
@@ -98,7 +116,11 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean } = {
     if (url.endsWith('/join')) {
       return Promise.resolve({
         ok: true, status: 200, headers: headers(null),
-        json: () => Promise.resolve({ whipUrl: 'https://live.example.com/whip', feeds }),
+        json: () => Promise.resolve({
+          whipUrl: 'https://live.example.com/whip',
+          feeds,
+          ...(opts.iceServers ? { iceServers: opts.iceServers } : {}),
+        }),
       });
     }
     if (method === 'POST' && url.endsWith('/fast/whep') && opts.failFast) {
@@ -132,10 +154,10 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean } = {
     fetch,
     URL,
     Promise,
-    setTimeout,
+    setTimeout: pageSetTimeout,
   };
   vm.runInNewContext(script, context);
-  return { els, pcs, requests };
+  return { els, pcs, requests, delays };
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 10));
@@ -195,5 +217,48 @@ describe('guest page return feeds', () => {
     ]);
     expect(pcs[1].closed).toBe(true);
     expect(pcs[2].closed).toBe(true);
+  });
+});
+
+describe('guest page ICE servers', () => {
+  const STUN = { urls: 'stun:stun.l.google.com:19302' };
+  // Strom sends `urls` as a string; RTCIceServer also takes an array.
+  const DEPLOYMENT = [
+    { urls: 'stun:stun.example.com:3478' },
+    { urls: ['turn:turn.example.com:3478'], username: 'u', credential: 'p' },
+  ];
+
+  it("uses the join response's ICE servers for the publish and the returns", async () => {
+    const { els, pcs } = runPage(await pageScript(), [PICTURE], { iceServers: DEPLOYMENT });
+    await flush();
+    els['golive'].fire('click');
+    await flush();
+    expect(pcs).toHaveLength(2);
+    expect(pcs[0].config).toEqual({ iceServers: DEPLOYMENT });
+    expect(pcs[1].config).toEqual({ iceServers: DEPLOYMENT });
+  });
+
+  it('keeps its STUN server when the join response has none', async () => {
+    const { els, pcs } = runPage(await pageScript(), [PICTURE]);
+    await flush();
+    els['golive'].fire('click');
+    await flush();
+    expect(pcs[0].config).toEqual({ iceServers: [STUN] });
+  });
+
+  it('waits longer for ICE gathering when there is a TURN server', async () => {
+    const withTurn = runPage(await pageScript(), [], { iceServers: DEPLOYMENT, gathering: 'gathering' });
+    await flush();
+    withTurn.els['golive'].fire('click');
+    await flush();
+    expect(withTurn.requests.some((r) => r.url === 'https://live.example.com/whip')).toBe(true);
+    expect(withTurn.delays).toContain(6000);
+
+    const stunOnly = runPage(await pageScript(), [], { gathering: 'gathering' });
+    await flush();
+    stunOnly.els['golive'].fire('click');
+    await flush();
+    expect(stunOnly.delays).toContain(2000);
+    expect(stunOnly.delays).not.toContain(6000);
   });
 });

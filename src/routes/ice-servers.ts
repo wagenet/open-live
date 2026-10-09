@@ -2,8 +2,6 @@ import type { FastifyPluginAsync } from 'fastify';
 import { StromClientError } from '../lib/strom.js';
 import { getIceServers } from '../lib/ice-servers.js';
 
-export { resetIceServersCache } from '../lib/ice-servers.js';
-
 /**
  * GET /api/v1/ice-servers
  *

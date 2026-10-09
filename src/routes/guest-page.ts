@@ -247,6 +247,13 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     // ---- WebRTC helpers ----------------------------------------------------
+    // True when the ICE servers include a TURN server.
+    function hasTurn() {
+      return ICE.iceServers.some(function (s) {
+        return [].concat(s.urls).some(function (u) { return /^turns?:/.test(u); });
+      });
+    }
+
     function waitForIce(pc) {
       return new Promise(function (resolve) {
         if (pc.iceGatheringState === "complete") return resolve();
@@ -255,8 +262,10 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         pc.addEventListener("icegatheringstatechange", function () {
           if (pc.iceGatheringState === "complete") finish();
         });
-        // Don't wait forever for a TURN-less environment: cap gathering.
-        setTimeout(finish, 2000);
+        // Don't wait forever: cap gathering. A TURN allocation can take
+        // seconds, and a guest who needs the relay has no other candidate
+        // Strom can reach, so give it longer.
+        setTimeout(finish, hasTurn() ? 6000 : 2000);
       });
     }
 

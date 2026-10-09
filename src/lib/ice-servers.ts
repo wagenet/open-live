@@ -12,9 +12,14 @@ import { config } from '../config.js';
  * config changes rarely so a stale list is far better than none. The cache is
  * dropped after 5 minutes so expired TURN credentials are not served
  * indefinitely. Throws when Strom fails and nothing is cached.
+ *
+ * A lookup gives up after ICE_SERVERS_TIMEOUT_MS, token exchange included: it
+ * is on the guest join's path, and a hung Strom must not hold a guest on
+ * "Connecting…" for the fetch's own ~5 minute default.
  */
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
+export const ICE_SERVERS_TIMEOUT_MS = 3000;
 let cachedIceServers: IceServer[] | null = null;
 let cacheTimestamp = 0;
 
@@ -31,20 +36,40 @@ export function resetIceServersCache(): void {
   cachedIceServers = null;
 }
 
-/** The list, and whether it is the cached one served because Strom failed. */
-export async function getIceServers(): Promise<{ iceServers: IceServer[]; stale?: unknown }> {
+/**
+ * The token, or undefined once `ms` pass. The exchange itself is shared with
+ * every other caller (getStromToken coalesces them), so it is not aborted;
+ * this lookup only stops waiting for it.
+ */
+async function tokenWithin(ms: number): Promise<string | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+  });
+  try {
+    return await Promise.race([getStromToken(config.stromToken).catch(() => undefined), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The list, and the error when it is the cached one served because Strom failed. */
+export async function getIceServers(): Promise<{ iceServers: IceServer[]; stale?: Error }> {
   if (Date.now() - cacheTimestamp > CACHE_TTL_MS) {
     cachedIceServers = null;
   }
+  const deadline = Date.now() + ICE_SERVERS_TIMEOUT_MS;
   try {
-    const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+    const stromToken = await tokenWithin(ICE_SERVERS_TIMEOUT_MS);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
-    const { ice_servers } = await strom.system.iceServers();
+    const { ice_servers } = await strom.system.iceServers(Math.max(1, deadline - Date.now()));
     cachedIceServers = ice_servers;
     cacheTimestamp = Date.now();
     return { iceServers: ice_servers };
   } catch (err) {
-    if (cachedIceServers) return { iceServers: cachedIceServers, stale: err };
+    if (cachedIceServers) {
+      return { iceServers: cachedIceServers, stale: err instanceof Error ? err : new Error(String(err)) };
+    }
     throw err;
   }
 }
