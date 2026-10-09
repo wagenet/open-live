@@ -90,7 +90,17 @@ function runPage(script: string, feeds: Feed[], opts: PageOpts = {}) {
     state: FakePc = { kinds: [], closed: false, config: undefined };
     iceGatheringState = opts.gathering ?? 'complete';
     localDescription = { sdp: 'offer' };
-    constructor(config: unknown) {
+    constructor(config: { iceServers?: Array<{ urls: string | string[]; username?: string; credential?: string }> }) {
+      // As a browser must (WebRTC §4.4.1.1): an unknown scheme is a SyntaxError,
+      // a TURN URL without a username and credential an InvalidAccessError.
+      for (const server of config?.iceServers ?? []) {
+        for (const url of ([] as string[]).concat(server.urls)) {
+          if (!/^(stuns?|turns?):/.test(url)) throw Object.assign(new Error(`bad ICE url ${url}`), { name: 'SyntaxError' });
+          if (/^turns?:/.test(url) && (server.username === undefined || server.credential === undefined)) {
+            throw Object.assign(new Error(`no credentials for ${url}`), { name: 'InvalidAccessError' });
+          }
+        }
+      }
       this.state.config = config;
       pcs.push(this.state);
     }
@@ -222,42 +232,65 @@ describe('guest page return feeds', () => {
 
 describe('guest page ICE servers', () => {
   const STUN = { urls: 'stun:stun.l.google.com:19302' };
-  // Strom sends `urls` as a string; RTCIceServer also takes an array.
+  // Strom's shape: `urls` is one string.
   const DEPLOYMENT = [
     { urls: 'stun:stun.example.com:3478' },
+    { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
+  ];
+  // RTCIceServer also takes an array.
+  const DEPLOYMENT_ARRAYS = [
+    { urls: ['stun:stun.example.com:3478'] },
     { urls: ['turn:turn.example.com:3478'], username: 'u', credential: 'p' },
   ];
 
+  async function goLive(opts: PageOpts) {
+    const page = runPage(await pageScript(), [PICTURE], opts);
+    await flush();
+    page.els['golive'].fire('click');
+    await flush();
+    return page;
+  }
+
+  const published = (requests: Request[]) => requests.some((r) => r.url === 'https://live.example.com/whip');
+
   it("uses the join response's ICE servers for the publish and the returns", async () => {
-    const { els, pcs } = runPage(await pageScript(), [PICTURE], { iceServers: DEPLOYMENT });
-    await flush();
-    els['golive'].fire('click');
-    await flush();
-    expect(pcs).toHaveLength(2);
-    expect(pcs[0].config).toEqual({ iceServers: DEPLOYMENT });
-    expect(pcs[1].config).toEqual({ iceServers: DEPLOYMENT });
+    for (const iceServers of [DEPLOYMENT, DEPLOYMENT_ARRAYS]) {
+      const { pcs } = await goLive({ iceServers });
+      expect(pcs).toHaveLength(2);
+      expect(pcs[0].config).toEqual({ iceServers });
+      expect(pcs[1].config).toEqual({ iceServers });
+    }
   });
 
   it('keeps its STUN server when the join response has none', async () => {
-    const { els, pcs } = runPage(await pageScript(), [PICTURE]);
-    await flush();
-    els['golive'].fire('click');
-    await flush();
+    const { pcs } = await goLive({});
     expect(pcs[0].config).toEqual({ iceServers: [STUN] });
   });
 
-  it('waits longer for ICE gathering when there is a TURN server', async () => {
-    const withTurn = runPage(await pageScript(), [], { iceServers: DEPLOYMENT, gathering: 'gathering' });
-    await flush();
-    withTurn.els['golive'].fire('click');
-    await flush();
-    expect(withTurn.requests.some((r) => r.url === 'https://live.example.com/whip')).toBe(true);
-    expect(withTurn.delays).toContain(6000);
+  it('drops a TURN entry without credentials, which the browser would reject, and goes live', async () => {
+    const { pcs, requests, els } = await goLive({
+      iceServers: [{ urls: 'stun:stun.example.com:3478' }, { urls: 'turn:turn.example.com:3478' }],
+    });
+    expect(pcs[0].config).toEqual({ iceServers: [{ urls: 'stun:stun.example.com:3478' }] });
+    expect(published(requests)).toBe(true);
+    expect(els['banner'].className).toBe('live');
+  });
 
-    const stunOnly = runPage(await pageScript(), [], { gathering: 'gathering' });
-    await flush();
-    stunOnly.els['golive'].fire('click');
-    await flush();
+  it('falls back to its STUN server when the browser rejects the list, and goes live', async () => {
+    const { pcs, requests, els } = await goLive({ iceServers: [{ urls: 'bogus:turn.example.com' }] });
+    expect(pcs[0].config).toEqual({ iceServers: [STUN] });
+    expect(published(requests)).toBe(true);
+    expect(els['banner'].className).toBe('live');
+  });
+
+  it('waits longer for ICE gathering when there is a TURN server', async () => {
+    for (const iceServers of [DEPLOYMENT, DEPLOYMENT_ARRAYS]) {
+      const withTurn = await goLive({ iceServers, gathering: 'gathering' });
+      expect(published(withTurn.requests)).toBe(true);
+      expect(withTurn.delays).toContain(6000);
+    }
+
+    const stunOnly = await goLive({ gathering: 'gathering' });
     expect(stunOnly.delays).toContain(2000);
     expect(stunOnly.delays).not.toContain(6000);
   });

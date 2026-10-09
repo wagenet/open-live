@@ -284,8 +284,10 @@ describe('POST /api/v1/guests/:inviteId/join', () => {
     // succeeds and `intercomLine` is absent (spec §Configuration, OQ1).
     expect(body.intercomLine).toBeUndefined();
     expect(sessionsStore.get(body.guestId)?.intercomLineId).toBeUndefined();
-    // The page's ICE servers are Strom's, TURN included.
+    // The page's ICE servers are Strom's, TURN included, looked up with the
+    // join's deadline.
     expect(body.iceServers).toEqual(iceServers);
+    expect(getIceServersMock).toHaveBeenCalledWith({ timeoutMs: 3000 });
   });
 
   it('honours a pinned mixerInput from the invite', async () => {

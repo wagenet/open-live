@@ -1,7 +1,8 @@
 /**
  * lib/ice-servers.ts — the ICE lookup shared by GET /api/v1/ice-servers and
- * the guest join: its cache, stale-on-error, and the deadline that keeps a
- * hung Strom or token exchange off the guest's join path.
+ * the guest join: its cache, stale-on-error, and the deadline the join passes
+ * so a hung Strom or token exchange stays off the guest's path. Without a
+ * deadline (the crew route) it waits, as it always has.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -25,7 +26,7 @@ vi.mock('../lib/strom-token.js', () => ({
   getStromToken: getStromTokenMock,
 }));
 
-import { getIceServers, resetIceServersCache, ICE_SERVERS_TIMEOUT_MS } from '../lib/ice-servers.js';
+import { getIceServers, resetIceServersCache } from '../lib/ice-servers.js';
 import { StromClientError } from '../lib/strom.js';
 
 const LIST = [{ urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' }];
@@ -41,12 +42,18 @@ afterEach(() => {
 });
 
 describe('getIceServers', () => {
-  it("returns Strom's list, asking Strom to answer within the deadline", async () => {
+  it("returns Strom's list, with no deadline unless one is asked for", async () => {
     iceServersMock.mockResolvedValue({ ice_servers: LIST });
     await expect(getIceServers()).resolves.toEqual({ iceServers: LIST });
+    expect(iceServersMock).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it('asks Strom to answer within a deadline when given one', async () => {
+    iceServersMock.mockResolvedValue({ ice_servers: LIST });
+    await expect(getIceServers({ timeoutMs: 3000 })).resolves.toEqual({ iceServers: LIST });
     const [timeoutMs] = iceServersMock.mock.calls[0];
     expect(timeoutMs).toBeGreaterThan(0);
-    expect(timeoutMs).toBeLessThanOrEqual(ICE_SERVERS_TIMEOUT_MS);
+    expect(timeoutMs).toBeLessThanOrEqual(3000);
   });
 
   it('serves the cached list, with the error, when Strom fails', async () => {
@@ -72,14 +79,27 @@ describe('getIceServers', () => {
     await expect(getIceServers()).rejects.toBeInstanceOf(StromClientError);
   });
 
-  it('stops waiting for a hung token exchange at the deadline', async () => {
+  it('stops waiting for a hung token exchange at the deadline, without asking Strom', async () => {
     vi.useFakeTimers();
     getStromTokenMock.mockReturnValue(new Promise(() => {}));
     iceServersMock.mockResolvedValue({ ice_servers: LIST });
+    const lookup = getIceServers({ timeoutMs: 3000 });
+    const settled = expect(lookup).rejects.toThrow('No Strom token within 3000 ms');
+    await vi.advanceTimersByTimeAsync(3000);
+    await settled;
+    // A Strom that needs the token cannot answer without it.
+    expect(iceServersMock).not.toHaveBeenCalled();
+  });
+
+  it('waits for a slow token exchange when there is no deadline', async () => {
+    vi.useFakeTimers();
+    let giveToken: (token: string) => void = () => {};
+    getStromTokenMock.mockReturnValue(new Promise<string>((resolve) => { giveToken = resolve; }));
+    iceServersMock.mockResolvedValue({ ice_servers: LIST });
     const lookup = getIceServers();
-    await vi.advanceTimersByTimeAsync(ICE_SERVERS_TIMEOUT_MS);
-    // Strom is still asked, with whatever time is left.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(iceServersMock).not.toHaveBeenCalled();
+    giveToken('token');
     await expect(lookup).resolves.toEqual({ iceServers: LIST });
-    expect(iceServersMock.mock.calls[0][0]).toBeGreaterThan(0);
   });
 });

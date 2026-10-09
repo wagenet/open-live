@@ -13,13 +13,13 @@ import { config } from '../config.js';
  * dropped after 5 minutes so expired TURN credentials are not served
  * indefinitely. Throws when Strom fails and nothing is cached.
  *
- * A lookup gives up after ICE_SERVERS_TIMEOUT_MS, token exchange included: it
- * is on the guest join's path, and a hung Strom must not hold a guest on
- * "Connecting…" for the fetch's own ~5 minute default.
+ * A caller that must not wait passes `timeoutMs`: the guest join does, so a
+ * hung Strom cannot hold a guest on "Connecting…". The deadline covers the
+ * token exchange and the Strom call. Without it the lookup waits as long as
+ * Strom and the token service take.
  */
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-export const ICE_SERVERS_TIMEOUT_MS = 3000;
 let cachedIceServers: IceServer[] | null = null;
 let cacheTimestamp = 0;
 
@@ -36,33 +36,43 @@ export function resetIceServersCache(): void {
   cachedIceServers = null;
 }
 
+/** The Strom token; undefined when there is none or the exchange fails. */
+function stromToken(): Promise<string | undefined> {
+  return getStromToken(config.stromToken).catch(() => undefined);
+}
+
 /**
- * The token, or undefined once `ms` pass. The exchange itself is shared with
- * every other caller (getStromToken coalesces them), so it is not aborted;
- * this lookup only stops waiting for it.
+ * The Strom token, or a rejection once `ms` pass: a Strom that needs the
+ * token cannot answer without it, so there is no point asking. The exchange
+ * itself is shared with every other caller (getStromToken coalesces them), so
+ * it is not aborted; this lookup only stops waiting for it.
  */
-async function tokenWithin(ms: number): Promise<string | undefined> {
+async function stromTokenWithin(ms: number): Promise<string | undefined> {
   let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(undefined), ms);
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`No Strom token within ${ms} ms`)), ms);
   });
   try {
-    return await Promise.race([getStromToken(config.stromToken).catch(() => undefined), timeout]);
+    return await Promise.race([stromToken(), timeout]);
   } finally {
     clearTimeout(timer);
   }
 }
 
 /** The list, and the error when it is the cached one served because Strom failed. */
-export async function getIceServers(): Promise<{ iceServers: IceServer[]; stale?: Error }> {
+export async function getIceServers(
+  { timeoutMs }: { timeoutMs?: number } = {},
+): Promise<{ iceServers: IceServer[]; stale?: Error }> {
   if (Date.now() - cacheTimestamp > CACHE_TTL_MS) {
     cachedIceServers = null;
   }
-  const deadline = Date.now() + ICE_SERVERS_TIMEOUT_MS;
+  const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
   try {
-    const stromToken = await tokenWithin(ICE_SERVERS_TIMEOUT_MS);
-    const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
-    const { ice_servers } = await strom.system.iceServers(Math.max(1, deadline - Date.now()));
+    const token = timeoutMs === undefined ? await stromToken() : await stromTokenWithin(timeoutMs);
+    const strom = new StromClient({ baseUrl: config.stromUrl, token });
+    const { ice_servers } = await strom.system.iceServers(
+      deadline === undefined ? undefined : Math.max(1, deadline - Date.now()),
+    );
     cachedIceServers = ice_servers;
     cacheTimestamp = Date.now();
     return { iceServers: ice_servers };

@@ -246,7 +246,11 @@ Browsers get their ICE servers from Strom's `STROM_SERVER_ICE_SERVERS`: the
 studio through `GET /api/v1/ice-servers`, and guests in their join response.
 A guest whose browser cannot reach Strom's own candidates (Strom behind NAT,
 or in Kubernetes without host networking) connects only through a TURN
-server on that list.
+server on that list. A browser takes a TURN server only with a username and
+credential (`turn:user:pass@host` in Strom's list); the guest page leaves out
+a TURN entry without them. With a TURN server on the list, the page waits up
+to 6s for ICE gathering, so a guest who cannot reach it goes live that much
+later.
 
 A TURN server there with long-term credentials (`turn:user:pass@host`) hands
 those credentials to every guest who joins, and an invite link is a bearer

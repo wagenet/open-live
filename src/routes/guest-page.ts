@@ -151,7 +151,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // (Strom's STROM_SERVER_ICE_SERVERS, TURN included), which a guest off the
     // network needs to reach Strom; until then, or without them, a public STUN
     // server for srflx candidate discovery.
-    var ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+    var STUN_ONLY = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+    var ICE = STUN_ONLY;
 
     // ---- Elements ----------------------------------------------------------
     var banner = document.getElementById("banner");
@@ -247,6 +248,27 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     // ---- WebRTC helpers ----------------------------------------------------
+    // False for an entry the browser would reject, failing the whole
+    // RTCPeerConnection: a TURN URL without a username and credential (Strom
+    // passes "turn:host:port" through without them).
+    function usableIceServer(server) {
+      var urls = [].concat(server.urls || []);
+      return urls.length > 0 && urls.every(function (u) {
+        return !/^turns?:/.test(u) || (server.username && server.credential);
+      });
+    }
+
+    // A PeerConnection on the ICE servers, or on the STUN server alone if the
+    // browser rejects them, so a bad entry cannot stop the guest going live.
+    function newPeerConnection() {
+      try {
+        return new RTCPeerConnection(ICE);
+      } catch (e) {
+        ICE = STUN_ONLY;
+        return new RTCPeerConnection(ICE);
+      }
+    }
+
     // True when the ICE servers include a TURN server.
     function hasTurn() {
       return ICE.iceServers.some(function (s) {
@@ -270,7 +292,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     }
 
     function whipPublish(url, stream) {
-      var pc = new RTCPeerConnection(ICE);
+      var pc = newPeerConnection();
       stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
       return pc.createOffer().then(function (offer) {
         return pc.setLocalDescription(offer);
@@ -296,7 +318,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     // Open a recvonly WHEP session and hand its stream to onStream. Resolves
     // with { pc, resource } once the answer is applied.
     function whepPlay(url, withVideo, onStream) {
-      var pc = new RTCPeerConnection(ICE);
+      var pc = newPeerConnection();
       var resource = null;
       if (withVideo) pc.addTransceiver("video", { direction: "recvonly" });
       pc.addTransceiver("audio", { direction: "recvonly" });
@@ -393,7 +415,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         });
       }).then(function (data) {
         joinData = data;
-        if (data.iceServers && data.iceServers.length) ICE = { iceServers: data.iceServers };
+        var servers = (data.iceServers || []).filter(usableIceServer);
+        if (servers.length) ICE = { iceServers: servers };
         return whipPublish(data.whipUrl, localStream);
       }).then(function () {
         live = true;

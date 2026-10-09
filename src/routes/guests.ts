@@ -230,6 +230,9 @@ async function teardownGuestWhip(
   });
 }
 
+/** How long a guest join waits for Strom's ICE servers before going on without them. */
+export const JOIN_ICE_SERVERS_TIMEOUT_MS = 3000;
+
 const guestsRoutes: FastifyPluginAsync = async (fastify) => {
   // -------------------------------------------------------------------------
   // Invites (production-scoped, API_KEY gated)
@@ -566,11 +569,11 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         ...(fastLive ? [{ id: 'fast', url: `${returnsBase}/fast/whep`, video: false }] : []),
       ];
       // The page's ICE servers: Strom's list, so a guest off the network gets
-      // the deployment's TURN server. Best effort — without it the page keeps
-      // its built-in STUN server.
+      // the deployment's TURN server. Best effort, and bounded — without it
+      // the page keeps its built-in STUN server.
       let iceServers: IceServer[] | undefined;
       try {
-        ({ iceServers } = await getIceServers());
+        ({ iceServers } = await getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS }));
       } catch (err) {
         fastify.log.warn({ err }, 'POST guests/:id/join — ICE servers unavailable');
       }
