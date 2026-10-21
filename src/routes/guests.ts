@@ -31,6 +31,8 @@ import {
   clearGuestSlotPicture,
   restoreGuestSlotPicture,
 } from '../lib/guest-slot-label.js';
+import { getIceServers } from '../lib/ice-servers.js';
+import type { IceServer } from '../lib/strom.js';
 import {
   isIntercomEnabled,
   provisionGuestLine,
@@ -297,6 +299,9 @@ async function resetGuestSlot(
   // on its own.
   await clearGuestSlotPicture(production, mixerInput, log);
 }
+
+/** How long a guest join waits for Strom's ICE servers before going on without them. */
+export const JOIN_ICE_SERVERS_TIMEOUT_MS = 3000;
 
 const guestsRoutes: FastifyPluginAsync = async (fastify) => {
   // -------------------------------------------------------------------------
@@ -721,11 +726,21 @@ const guestsRoutes: FastifyPluginAsync = async (fastify) => {
         ...(returnLive ? [{ id: 'picture', url: `${returnsBase}/picture/whep`, video: true }] : []),
         ...(fastLive ? [{ id: 'fast', url: `${returnsBase}/fast/whep`, video: false }] : []),
       ];
+      // The page's ICE servers: Strom's list, so a guest off the network gets
+      // the deployment's TURN server. Best effort, and bounded — without it
+      // the page keeps its built-in STUN server.
+      let iceServers: IceServer[] | undefined;
+      try {
+        ({ iceServers } = await getIceServers({ timeoutMs: JOIN_ICE_SERVERS_TIMEOUT_MS }));
+      } catch (err) {
+        fastify.log.warn({ err }, 'POST guests/:id/join — ICE servers unavailable');
+      }
       return reply.status(200).send({
         guestId: session._id,
         ...(whipUrl ? { whipUrl } : {}),
         returnOnly: !takesWhip,
         feeds,
+        ...(iceServers?.length ? { iceServers } : {}),
         modes: returnModesFor(mixerInput, fastLive),
         defaultMode: 'program-minus',
         returnMode,

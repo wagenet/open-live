@@ -58,6 +58,7 @@ class FakeElement {
 interface FakePc {
   kinds: string[];
   closed: boolean;
+  config: unknown;
   trackListener?: (e: { streams: unknown[] }) => void;
 }
 
@@ -75,7 +76,24 @@ const MODES = [
   { key: 'low-latency-minus', label: 'Conversation (low latency)', synced: false, excludesMixerInput: 'in1', delivery: { kind: 'feed', feed: 'fast' } },
 ];
 
-function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; returnMode?: string; hangReturnDelete?: boolean; hook?: (method: string, url: string) => Promise<never> | undefined; joinGate?: (n: number) => Promise<void> | undefined } = {}) {
+interface PageOpts {
+  failFast?: boolean;
+  returnMode?: string;
+  hangReturnDelete?: boolean;
+  hook?: (method: string, url: string) => Promise<never> | undefined;
+  joinGate?: (n: number) => Promise<void> | undefined;
+  /** The join response's iceServers; absent when undefined. */
+  iceServers?: unknown[];
+  /** The join response has no whipUrl: a return-only slot. */
+  returnOnly?: boolean;
+  /**
+   * Each PeerConnection's iceGatheringState; 'complete' skips the gathering
+   * wait. Set, the page's long timers (the gathering cap) fire at once.
+   */
+  gathering?: string;
+}
+
+function runPage(script: string, feeds: Feed[], opts: PageOpts = {}) {
   const els: Record<string, FakeElement> = {};
   const el = (id: string) => (els[id] ??= new FakeElement());
   for (const id of ['return', 'return-hint', 'return-mode', 'self-warning', 'mute', 'leave']) el(id).classList.add('hidden');
@@ -85,12 +103,31 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
   const server = { mode: opts.returnMode ?? 'program-minus' };
   let interval: (() => void) | null = null;
   const windowListeners: Record<string, Array<() => void>> = {};
+  // The page's timer delays.
+  const delays: number[] = [];
+  const pageSetTimeout = (fn: () => void, ms = 0) => {
+    delays.push(ms);
+    return setTimeout(fn, opts.gathering && ms >= 1000 ? 0 : ms);
+  };
 
   class RTCPeerConnection {
-    state: FakePc = { kinds: [], closed: false };
-    iceGatheringState = 'complete';
+    state: FakePc = { kinds: [], closed: false, config: undefined };
+    iceGatheringState = opts.gathering ?? 'complete';
     localDescription = { sdp: 'offer' };
-    constructor() { pcs.push(this.state); }
+    constructor(config: { iceServers?: Array<{ urls: string | string[]; username?: string; credential?: string }> }) {
+      // As a browser must (WebRTC §4.4.1.1): an unknown scheme is a SyntaxError,
+      // a TURN URL without a username and credential an InvalidAccessError.
+      for (const server of config?.iceServers ?? []) {
+        for (const url of ([] as string[]).concat(server.urls)) {
+          if (!/^(stuns?|turns?):/i.test(url)) throw Object.assign(new Error(`bad ICE url ${url}`), { name: 'SyntaxError' });
+          if (/^turns?:/i.test(url) && (server.username === undefined || server.credential === undefined)) {
+            throw Object.assign(new Error(`no credentials for ${url}`), { name: 'InvalidAccessError' });
+          }
+        }
+      }
+      this.state.config = config;
+      pcs.push(this.state);
+    }
     addTrack() {}
     addTransceiver(kind: string) { this.state.kinds.push(kind); }
     addEventListener(type: string, fn: (e: { streams: unknown[] }) => void) {
@@ -117,8 +154,10 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
       const joinResponse = () => ({
         ok: true, status: 200, headers: headers(null),
         json: () => Promise.resolve({
-          whipUrl: 'https://live.example.com/whip', feeds, modes: MODES,
+          ...(opts.returnOnly ? {} : { whipUrl: 'https://live.example.com/whip' }),
+          feeds, modes: MODES,
           defaultMode: 'program-minus', returnMode: server.mode,
+          ...(opts.iceServers ? { iceServers: opts.iceServers } : {}),
         }),
       });
       return gate ? gate.then(joinResponse) : Promise.resolve(joinResponse());
@@ -166,7 +205,7 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
     URL,
     Promise,
     AbortController,
-    setTimeout,
+    setTimeout: pageSetTimeout,
     clearTimeout,
     setInterval: (fn: () => void) => { interval = fn; return 1; },
     clearInterval: () => { interval = null; },
@@ -176,6 +215,7 @@ function runPage(script: string, feeds: Feed[], opts: { failFast?: boolean; retu
     els,
     pcs,
     requests,
+    delays,
     server,
     /** Runs one return-mode poll tick, if polling. */
     tick: () => interval?.(),
@@ -394,5 +434,93 @@ describe('guest page return feeds', () => {
     els['leave'].fire('click');
     await vi.advanceTimersByTimeAsync(10);
     expect(els['banner'].textContent).toMatch(/You have left/);
+  });
+});
+
+describe('guest page ICE servers', () => {
+  const STUN = { urls: 'stun:stun.l.google.com:19302' };
+  // Strom's shape: `urls` is one string.
+  const DEPLOYMENT = [
+    { urls: 'stun:stun.example.com:3478' },
+    { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
+  ];
+  // RTCIceServer also takes an array.
+  const DEPLOYMENT_ARRAYS = [
+    { urls: ['stun:stun.example.com:3478'] },
+    { urls: ['turn:turn.example.com:3478'], username: 'u', credential: 'p' },
+  ];
+
+  async function goLive(opts: PageOpts) {
+    const page = runPage(await pageScript(), [PICTURE], opts);
+    await flush();
+    page.els['golive'].fire('click');
+    await flush();
+    return page;
+  }
+
+  const published = (requests: Request[]) => requests.some((r) => r.url === 'https://live.example.com/whip');
+
+  it("uses the join response's ICE servers for the publish and the returns", async () => {
+    for (const iceServers of [DEPLOYMENT, DEPLOYMENT_ARRAYS]) {
+      const { pcs } = await goLive({ iceServers });
+      expect(pcs).toHaveLength(2);
+      expect(pcs[0].config).toEqual({ iceServers });
+      expect(pcs[1].config).toEqual({ iceServers });
+    }
+  });
+
+  it('gives a return-only slot the ICE servers for its returns', async () => {
+    const { pcs, requests } = await goLive({ iceServers: DEPLOYMENT, returnOnly: true });
+    expect(published(requests)).toBe(false);
+    expect(pcs).toHaveLength(1);
+    expect(pcs[0].kinds).toEqual(['video', 'audio']);
+    expect(pcs[0].config).toEqual({ iceServers: DEPLOYMENT });
+  });
+
+  it('keeps its STUN server when the join response has none', async () => {
+    const { pcs } = await goLive({});
+    expect(pcs[0].config).toEqual({ iceServers: [STUN] });
+  });
+
+  it('drops a TURN entry without credentials, which the browser would reject, and goes live', async () => {
+    const { pcs, requests, els } = await goLive({
+      iceServers: [{ urls: 'stun:stun.example.com:3478' }, { urls: 'turn:turn.example.com:3478' }],
+    });
+    expect(pcs[0].config).toEqual({ iceServers: [{ urls: 'stun:stun.example.com:3478' }] });
+    expect(published(requests)).toBe(true);
+    expect(els['banner'].className).toBe('live');
+  });
+
+  it('drops an uppercase TURN entry without credentials, as the browser parses the scheme case-insensitively', async () => {
+    const { pcs, requests } = await goLive({
+      iceServers: [{ urls: 'stun:stun.example.com:3478' }, { urls: 'TURN:turn.example.com:3478' }],
+    });
+    expect(pcs[0].config).toEqual({ iceServers: [{ urls: 'stun:stun.example.com:3478' }] });
+    expect(published(requests)).toBe(true);
+  });
+
+  it('falls back to its STUN server when the browser rejects the list, and goes live', async () => {
+    const { pcs, requests, els } = await goLive({ iceServers: [{ urls: 'bogus:turn.example.com' }] });
+    expect(pcs[0].config).toEqual({ iceServers: [STUN] });
+    expect(published(requests)).toBe(true);
+    expect(els['banner'].className).toBe('live');
+  });
+
+  it('waits longer for ICE gathering when there is a TURN server', async () => {
+    for (const iceServers of [DEPLOYMENT, DEPLOYMENT_ARRAYS]) {
+      const withTurn = await goLive({ iceServers, gathering: 'gathering' });
+      expect(published(withTurn.requests)).toBe(true);
+      expect(withTurn.delays).toContain(6000);
+    }
+
+    const upperTurn = await goLive({
+      iceServers: [{ urls: 'TURN:turn.example.com:3478', username: 'u', credential: 'p' }],
+      gathering: 'gathering',
+    });
+    expect(upperTurn.delays).toContain(6000);
+
+    const stunOnly = await goLive({ gathering: 'gathering' });
+    expect(stunOnly.delays).toContain(2000);
+    expect(stunOnly.delays).not.toContain(6000);
   });
 });
